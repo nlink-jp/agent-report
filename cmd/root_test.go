@@ -110,10 +110,13 @@ func plantTranscripts(t *testing.T) string {
 		t.Fatal(err)
 	}
 	lines := []string{
-		`{"ts":"2026-10-29T10:00:00Z","kind":"session","data":{"schema":2,"version":"v0.94.0 ` + marker + `","model":"/Users/` + marker + `/model","project":"/Users/` + marker + `","location":"global"}}`,
+		// Version and model values that a loose character-set pattern
+		// would have let through.
+		`{"ts":"2026-10-29T10:00:00Z","kind":"session","data":{"schema":2,"version":"v0.94.0-` + marker + `","model":"projects/` + marker + `-123/locations/us-central1/endpoints/9","project":"/Users/` + marker + `","location":"global"}}`,
 		`{"ts":"2026-10-29T10:00:01Z","kind":"message","data":{"role":"user","content":"` + marker + ` please","attachments":[{"ref":"` + marker + `","kind":"hook","content":"` + marker + `"}]}}`,
 		`{"ts":"2026-10-29T10:00:02Z","kind":"message","data":{"role":"assistant","content":"` + marker + `","tool_calls":[` +
 			`{"id":"c1","name":"shell_exec","args":{"command":"cat /Users/` + marker + `/.env","access":"read","gem_agent_purpose":"` + marker + `"}},` +
+			`{"id":"c5","name":"shell_exec","args":{"command":"x","access":"` + marker + `"}},` +
 			`{"id":"c2","name":"mcp__` + marker + ` server__q","args":{"q":"` + marker + `"}},` +
 			`{"id":"c3","name":"mcp__whois-lookup__lookup","args":{"query":"` + marker + `.example"}},` +
 			`{"id":"c4","name":"` + marker + `_tool","args":{}}]}}`,
@@ -127,6 +130,21 @@ func plantTranscripts(t *testing.T) string {
 		marker + ` not json`,
 	}
 	if err := os.WriteFile(filepath.Join(dir, marker+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ldir := filepath.Join(home, ".local", "state", "lagent", "sessions", "projects", "-Users-"+marker)
+	if err := os.MkdirAll(ldir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	llines := []string{
+		`{"ts":"2026-10-29T11:00:00Z","kind":"session","data":{"schema":2,"version":"v0.19.2","model":"` + marker + `@example.com","project":"/Users/` + marker + `"}}`,
+		`{"ts":"2026-10-29T11:00:01Z","kind":"message","data":{"role":"user","content":"Runtime facts for this session:\n- project: /Users/` + marker + `"}}`,
+		`{"ts":"2026-10-29T11:00:02Z","kind":"message","data":{"role":"user","content":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T11:00:03Z","kind":"message","data":{"role":"assistant","content":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T11:00:04Z","kind":"tool_skipped","data":{"name":"` + marker + `","detail":"` + marker + `"}}`,
+	}
+	if err := os.WriteFile(filepath.Join(ldir, marker+".jsonl"), []byte(strings.Join(llines, "\n")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return home
@@ -150,7 +168,7 @@ func TestNoTranscriptTextReachesTheOutput(t *testing.T) {
 	}
 }
 
-func TestReportCountsAndMissingRuntime(t *testing.T) {
+func TestReportCounts(t *testing.T) {
 	t.Setenv("HOME", plantTranscripts(t))
 	code, stdout, _ := runCLI("--since", "all", "--json")
 	if code != 0 {
@@ -164,15 +182,31 @@ func TestReportCountsAndMissingRuntime(t *testing.T) {
 		t.Fatalf("runtimes = %+v", rep.Runtimes)
 	}
 	g, l := rep.Runtimes[0], rep.Runtimes[1]
-	if g.Transcripts != "found" || l.Transcripts != "missing" {
-		t.Errorf("transcripts = %s, %s; want found, missing", g.Transcripts, l.Transcripts)
+	if g.Transcripts != "found" || l.Transcripts != "found" {
+		t.Errorf("transcripts = %s, %s; want found, found", g.Transcripts, l.Transcripts)
 	}
 	if g.Sessions.Count != 1 || g.Tools.MCP.Calls != 2 || g.Tools.UnknownNameCalls != 1 ||
-		g.Shell.ByLane["read"] != 1 || g.Anomalies.UnknownRecordKinds != 1 || g.Anomalies.UnreadableLines != 1 {
+		g.Shell.ByLane["read"] != 1 || g.Shell.ByLane["other"] != 1 ||
+		g.Anomalies.UnknownRecordKinds != 1 || g.Anomalies.UnreadableLines != 1 {
 		t.Errorf("gem-agent = %+v", g)
 	}
-	if rep.Period.Since != "" {
-		t.Errorf("since = %q; want empty for all time", rep.Period.Since)
+	if l.Turns.Count != 1 || l.Models["other"] != 1 || l.Anomalies.UnknownRecordKinds != 0 {
+		t.Errorf("lagent = %+v (the facts message is not a turn; tool_skipped is a known kind)", l)
+	}
+	if rep.Period.Since != "" || !strings.HasSuffix(rep.Period.Until, "Z") {
+		t.Errorf("period = %+v; want no since and a UTC until", rep.Period)
+	}
+}
+
+func TestMissingRuntimeAndMissingSessionsDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	code, stdout, _ := runCLI("--runtime", "lagent", "--json")
+	if code != 0 || !strings.Contains(stdout, `"transcripts": "missing"`) {
+		t.Errorf("default location absent: exit %d\n%s", code, stdout)
+	}
+	code, _, stderr := runCLI("--runtime", "lagent", "--sessions-dir", "/no/such/dir")
+	if code != 1 || !strings.Contains(stderr, "--sessions-dir") || strings.Contains(stderr, "/no/such/dir") {
+		t.Errorf("named directory absent: exit %d, stderr %q; want 1 without echoing the path", code, stderr)
 	}
 }
 

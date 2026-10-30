@@ -69,18 +69,59 @@ func TestDiscover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := Discover(root)
+	got, bad, err := Discover(root)
+	if err != nil || bad != 0 {
+		t.Fatal(err, bad)
+	}
+	want := []string{filepath.Join(root, "a.jsonl"), filepath.Join(root, "projects", "-p", "b.jsonl")}
+	if strings.Join(trim(got), "|") != strings.Join(trim(want), "|") {
+		t.Fatalf("Discover = %v; want %v (links below the root are not followed)", got, want)
+	}
+
+	if _, _, err := Discover(filepath.Join(root, "missing")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("missing root: err = %v; want fs.ErrNotExist", err)
+	}
+}
+
+func TestDiscoverFollowsALinkedRoot(t *testing.T) {
+	real := t.TempDir()
+	mustWrite(t, filepath.Join(real, "projects", "-p", "a.jsonl"))
+	link := filepath.Join(t.TempDir(), "sessions")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := Discover(link)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Discover(linked root) = %v, %v; want the one transcript", got, err)
+	}
+}
+
+func TestDiscoverCountsUnreadableDirectories(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "ok", "a.jsonl"))
+	locked := filepath.Join(root, "locked")
+	mustWrite(t, filepath.Join(locked, "b.jsonl"))
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	got, bad, err := Discover(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{filepath.Join(root, "a.jsonl"), filepath.Join(root, "projects", "-p", "b.jsonl")}
-	if strings.Join(got, "|") != strings.Join(want, "|") {
-		t.Fatalf("Discover = %v; want %v (symlinks are not followed)", got, want)
+	if len(got) != 1 || bad != 1 {
+		t.Fatalf("files %v, unreadable dirs %d; want 1 file and 1 unreadable dir", got, bad)
 	}
+}
 
-	if _, err := Discover(filepath.Join(root, "missing")); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("missing root: err = %v; want fs.ErrNotExist", err)
+// trim drops the leading /private macOS adds when a temp path is resolved.
+func trim(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = strings.TrimPrefix(p, "/private")
 	}
+	return out
 }
 
 func mustWrite(t *testing.T, path string) {

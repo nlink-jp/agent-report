@@ -46,29 +46,32 @@ type File struct {
 	BadLines  int      // lines that were not a JSON record
 }
 
-// Discover returns every *.jsonl file under root, sorted. Symbolic links
-// are not followed. A missing root is reported with fs.ErrNotExist.
-func Discover(root string) ([]string, error) {
-	if _, err := os.Stat(root); err != nil {
-		return nil, err
+// Discover returns every *.jsonl file under root, sorted, and how many
+// directories under it could not be read. The root itself may be a
+// symbolic link (a relocated state directory); links below it are not
+// followed. A missing root is reported with fs.ErrNotExist.
+func Discover(root string) (files []string, unreadableDirs int, err error) {
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, 0, err
 	}
-	var out []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(resolved, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			// An unreadable subdirectory is skipped, not fatal: the
-			// report counts what it could read.
-			if d != nil && d.IsDir() && path != root {
+			// An unreadable subdirectory is skipped and counted, not
+			// fatal: the report counts what it could read.
+			if d != nil && d.IsDir() && path != resolved {
+				unreadableDirs++
 				return fs.SkipDir
 			}
 			return err
 		}
 		if d.Type().IsRegular() && strings.HasSuffix(d.Name(), ".jsonl") {
-			out = append(out, path)
+			files = append(files, path)
 		}
 		return nil
 	})
-	sort.Strings(out)
-	return out, err
+	sort.Strings(files)
+	return files, unreadableDirs, err
 }
 
 // ReadFile reads one transcript.

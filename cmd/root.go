@@ -147,24 +147,29 @@ func sessionsDir(home, runtime string) string {
 }
 
 // report reads the transcripts and writes the summary. Paths never reach
-// the output: a missing directory is reported as "missing", an unreadable
-// file as a count.
+// the output: a missing default directory is reported as "missing", an
+// unreadable file or directory as a count. Times are written in UTC so the
+// report does not carry the reporter's time zone.
 func report(opts Options, version string, now time.Time, home string, w io.Writer) error {
 	rep := aggregate.Report{
 		Schema:      aggregate.SchemaVersion,
 		Tool:        "agent-report",
 		ToolVersion: version,
-		Period:      aggregate.Period{Until: now.Format(time.RFC3339)},
+		Period:      aggregate.Period{Until: now.UTC().Format(time.RFC3339)},
 	}
 	if !opts.Since.IsZero() {
-		rep.Period.Since = opts.Since.Format(time.RFC3339)
+		rep.Period.Since = opts.Since.UTC().Format(time.RFC3339)
 	}
 	for _, rt := range opts.Runtimes {
 		dir := opts.SessionsDir
 		if dir == "" {
 			dir = sessionsDir(home, rt)
 		}
-		rep.Runtimes = append(rep.Runtimes, collect(rt, dir, opts))
+		r, err := collect(rt, dir, opts)
+		if err != nil {
+			return err
+		}
+		rep.Runtimes = append(rep.Runtimes, r)
 	}
 	if opts.JSON {
 		return render.JSON(w, rep)
@@ -172,16 +177,23 @@ func report(opts Options, version string, now time.Time, home string, w io.Write
 	return render.Table(w, rep)
 }
 
-func collect(runtime, dir string, opts Options) aggregate.Runtime {
+// collect reads one runtime. A missing default directory means the
+// runtime is not installed and is reported as such; a missing directory
+// the operator named is a mistake and is an error.
+func collect(runtime, dir string, opts Options) (aggregate.Runtime, error) {
 	agg := aggregate.New(runtime, aggregate.Options{Since: opts.Since, MCPNames: opts.MCPNames})
-	files, err := transcript.Discover(dir)
+	files, unreadableDirs, err := transcript.Discover(dir)
 	if errors.Is(err, fs.ErrNotExist) {
+		if opts.SessionsDir != "" {
+			return aggregate.Runtime{}, errors.New("--sessions-dir: no such directory")
+		}
 		agg.Missing()
-		return agg.Result()
+		return agg.Result(), nil
 	}
 	if err != nil {
 		agg.Unreadable()
 	}
+	agg.UnreadableDirs(unreadableDirs)
 	for _, path := range files {
 		f, err := transcript.ReadFile(path)
 		if err != nil {
@@ -190,7 +202,7 @@ func collect(runtime, dir string, opts Options) aggregate.Runtime {
 		}
 		agg.Add(f)
 	}
-	return agg.Result()
+	return agg.Result(), nil
 }
 
 // versionLine is what both `version` and `--version` print — identical, so
