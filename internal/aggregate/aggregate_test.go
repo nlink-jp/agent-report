@@ -154,7 +154,11 @@ func TestDecisionsInterventionsModes(t *testing.T) {
 		add(13, "resumed", map[string]any{"version": "v1"}).
 		add(14, "clear", map[string]any{}).
 		add(15, "compaction", map[string]any{}).
-		add(16, "brand_new_kind", map[string]any{})
+		add(16, "brand_new_kind", map[string]any{}).
+		add(17, "mode_start", map[string]any{"auto_approve": true}). // resumed: same session
+		add(18, "riskbook_update", map[string]any{"action": "cleared"}).
+		add(19, "tool_skipped", map[string]any{"name": "x"}).
+		add(20, "gate_decision", map[string]any{"decision": "maybe", "source": "operator"})
 
 	rt := run(Options{}, s.f)
 	au := rt.Approvals.Auto
@@ -163,19 +167,19 @@ func TestDecisionsInterventionsModes(t *testing.T) {
 		t.Errorf("auto = %+v", au)
 	}
 	g := rt.Approvals.Gate
-	if g.Approved != 2 || g.Denied != 1 || g.MustPrompt != 1 ||
-		g.BySource["operator"] != 1 || g.BySource["allowlist"] != 1 || g.BySource[Other] != 1 {
+	if g.Approved != 2 || g.Denied != 1 || g.OtherDecision != 1 || g.MustPrompt != 1 ||
+		g.BySource["operator"] != 2 || g.BySource["allowlist"] != 1 || g.BySource[Other] != 1 {
 		t.Errorf("gate = %+v", g)
 	}
 	if rt.Approvals.HookDenied != 1 || rt.Interventions["round-limit"] != 1 || rt.Interventions["loop"] != 1 {
 		t.Errorf("hook %d interventions %v", rt.Approvals.HookDenied, rt.Interventions)
 	}
-	if rt.Modes != (Modes{SessionsStartedAutoApprove: 1, SessionsStartedReadOnly: 1, ModeChanges: 1}) {
+	if rt.Modes != (Modes{SessionsAutoApproveAtStart: 1, SessionsReadOnlyAtStart: 1, ModeChanges: 1}) {
 		t.Errorf("modes = %+v", rt.Modes)
 	}
-	if rt.EmptyModelResponses != 1 || rt.Sessions.Resumed != 1 || rt.Sessions.Cleared != 1 || rt.Context.Compactions != 1 {
-		t.Errorf("empty %d resumed %d cleared %d compactions %d",
-			rt.EmptyModelResponses, rt.Sessions.Resumed, rt.Sessions.Cleared, rt.Context.Compactions)
+	if rt.EmptyModelResponses != 1 || rt.Sessions.Resumed != 1 || rt.Context.Compactions != 1 {
+		t.Errorf("empty %d resumed %d compactions %d",
+			rt.EmptyModelResponses, rt.Sessions.Resumed, rt.Context.Compactions)
 	}
 	if rt.Anomalies.UnknownRecordKinds != 1 {
 		t.Errorf("unknown kinds = %d; want 1", rt.Anomalies.UnknownRecordKinds)
@@ -225,10 +229,14 @@ func TestClosedSetsForHeaderStrings(t *testing.T) {
 		newSession("a403021-dirty", "/Users/someone/models/private.gguf").f,
 		newSession("my secret build", "model with spaces").f,
 		newSession("", "../../etc").f,
+		// Strings that pass a loose pattern yet identify someone.
+		newSession("v1.0.0-acmecorp.secret-project", "projects/my-gcp-proj-123456/locations/us-central1/endpoints/9").f,
+		newSession("v1.0.0+acme", "user@example.com").f,
+		newSession("dev", "home/me/models/client-x.gguf").f,
 	}
 	rt := run(Options{}, files...)
-	wantV := map[string]int{"v0.94.0": 1, "v0.68.1-11-g19eb157-dirty": 1, "dev": 1, Other: 1, Unrecorded: 1}
-	wantM := map[string]int{"gemini-3.8-flash": 1, "google/gemma-4-26b-a4b-qat": 1, Other: 3}
+	wantV := map[string]int{"v0.94.0": 1, "v0.68.1-11-g19eb157-dirty": 1, "dev": 2, Other: 3, Unrecorded: 1}
+	wantM := map[string]int{"gemini-3.8-flash": 1, "google/gemma-4-26b-a4b-qat": 1, Other: 6}
 	if !equal(rt.Versions, wantV) {
 		t.Errorf("versions = %v; want %v", rt.Versions, wantV)
 	}
@@ -287,4 +295,79 @@ func equal(a, b map[string]int) bool {
 		}
 	}
 	return true
+}
+
+func TestRuntimeInjectedMessagesStartNoTurn(t *testing.T) {
+	s := newSession("v0.19.2", "google/gemma-4-26b-a4b-qat").
+		add(0, "message", user("Runtime facts for this session:\n- date: 2026-10-30")).
+		add(1, "message", user("note from lagent: the shell_exec call abandoned by the interrupt completed")).
+		add(2, "message", user("note from gem-agent: the read_file call abandoned by the interrupt completed")).
+		add(3, "message", user("gem-agent: this session was resumed on 2026-10-30")).
+		add(4, "message", user("hello")).
+		add(5, "message", answer())
+	rt := run(Options{}, s.f)
+	if rt.Turns.Count != 1 || rt.Turns.RoundsPerTurn.Max != 1 {
+		t.Errorf("turns %d rounds %+v; want 1 turn of 1 round", rt.Turns.Count, rt.Turns.RoundsPerTurn)
+	}
+}
+
+func TestOddArgumentsKeepTheMessage(t *testing.T) {
+	s := newSession("v0.19.2", "m").
+		add(0, "message", user("go")).
+		add(1, "message", calls(
+			call("shell_exec", map[string]any{"command": "x", "access": 1}),
+			call("read_file", map[string]any{"path": "a"}),
+		)).
+		add(2, "message", map[string]any{"role": "assistant", "tool_calls": []any{
+			map[string]any{"name": "shell_exec", "args": "not an object"},
+		}}).
+		add(3, "message", result("shell_exec", "y"))
+	rt := run(Options{}, s.f)
+	if rt.Tools.Builtin["read_file"].Calls != 1 || rt.Tools.MultiCallResponses != 1 {
+		t.Errorf("a non-string access lost its message: %+v", rt.Tools)
+	}
+	if rt.Shell.ByLane[Other] != 2 {
+		t.Errorf("lanes = %v; want other=2", rt.Shell.ByLane)
+	}
+	if rt.Anomalies.UnreadableLines != 0 {
+		t.Errorf("unreadable lines = %d; want 0", rt.Anomalies.UnreadableLines)
+	}
+}
+
+func TestTimeoutOnlyOnTheLastLine(t *testing.T) {
+	grep := "tools.go:1752: return result + \"\\n[command timed out after %s]\", nil\nmore output"
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(1, "message", calls(call("shell_exec", map[string]any{"access": "read"}))).
+		add(2, "message", result("shell_exec", grep)).
+		add(3, "message", calls(call("shell_exec", map[string]any{"access": "read"}))).
+		add(4, "message", result("shell_exec", "partial\n[command timed out after 2m0s]\n"))
+	if got := run(Options{}, s.f).Shell.Timeouts; got != 1 {
+		t.Errorf("timeouts = %d; want 1 (the grep result only mentions the marker)", got)
+	}
+}
+
+func TestCallBeforeThePeriodPairsWithItsResult(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(10, "message", calls(call("read_file", nil))).
+		add(7200, "message", result("read_file", "late")).
+		add(7201, "message", answer())
+	rt := run(Options{Since: t0.Add(time.Hour)}, s.f)
+	if rt.Anomalies.UnmatchedToolResults != 0 {
+		t.Errorf("unmatched = %d; want 0 (the call was made before the period)", rt.Anomalies.UnmatchedToolResults)
+	}
+	if rt.Tools.Builtin["read_file"].Calls != 0 || rt.Turns.Count != 0 {
+		t.Errorf("a call and turn from before the period were counted: %+v", rt)
+	}
+}
+
+func TestUnreadableDecisionRecordsAreCounted(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(1, "round_intervention", "not an object").
+		add(2, "mode_start", []int{1})
+	rt := run(Options{}, s.f)
+	if rt.Anomalies.UnreadableLines != 2 || len(rt.Interventions) != 0 || rt.Modes.SessionsAutoApproveAtStart != 0 {
+		t.Errorf("anomalies %+v interventions %v modes %+v", rt.Anomalies, rt.Interventions, rt.Modes)
+	}
 }

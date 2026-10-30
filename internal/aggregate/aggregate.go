@@ -2,10 +2,10 @@
 //
 // Strings read from a transcript reach the report only as map keys that
 // belong to a closed set: an enumerated value the runtimes write, a name
-// on the known built-in tool list, or a name that matches a strict
-// pattern. Everything else is counted under "other". Free text
-// (conversation, commands, paths, reasons) is read only to recognise a
-// fixed marker and is never copied out.
+// on the known built-in tool list, or a version, model or MCP server name
+// that matches a narrow pattern. Everything else is counted under
+// "other". Free text (conversation, commands, paths, reasons) is read
+// only to recognise a fixed marker and is never copied out.
 package aggregate
 
 import (
@@ -26,8 +26,8 @@ const Other = "other"
 const Unrecorded = "unrecorded"
 
 // BuiltinTools are the tool names gem-agent and lagent have declared to
-// the model, current and withdrawn. A call to any other non-MCP name (a
-// model can invent one) counts as unknown.
+// the model, current and withdrawn, as one list for both runtimes. A call
+// to any other non-MCP name (a model can invent one) counts as unknown.
 var BuiltinTools = setOf(
 	"agent_info", "agentic_file_search", "ask_user", "datetime",
 	"delete_memory", "edit_file", "file_info", "find_tools", "list_files",
@@ -48,7 +48,7 @@ var knownKinds = setOf(
 	"agentic_search_usage", "librarian", "mcp_advertise", "mcp_reload",
 	"mcp_fault", "skills_reload", "persistent_changes", "added_directories",
 	"tool_late_return", "tool_excluded", "tool_not_advertised",
-	"assistant_empty",
+	"tool_skipped", "assistant_empty", "riskbook_update",
 )
 
 var (
@@ -59,20 +59,40 @@ var (
 	gateSources = setOf("operator", "allowlist")
 	triggers    = setOf("round-limit", "loop")
 	shellLanes  = setOf("read", "write", "operator")
-	versionRe   = regexp.MustCompile(`^(v?\d+\.\d+\.\d+([-+.][0-9A-Za-z.-]+)?|dev)$`)
+
+	// A release tag, or `git describe` output for a build between tags:
+	// digits and a commit hash only, so nothing else rides along.
+	versionRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+(-\d+-g[0-9a-f]{7,40})?(-dirty)?$`)
 	// A build from an untagged commit reports only its hash.
 	untaggedRe = regexp.MustCompile(`^[0-9a-f]{7,40}(-dirty)?$`)
-	modelRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,99}$`)
-	serverRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	// A model id, optionally under one publisher prefix ("google/gemma-…").
+	// No "@" (an address), and at most one "/" (a resource path such as
+	// projects/<id>/locations/… or a file path has more).
+	modelRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}(/[A-Za-z0-9][A-Za-z0-9._:+-]{0,79})?$`)
+	serverRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 )
 
-// shellTimeoutMarker is the line both runtimes append to a shell result
-// that ran out of time.
+// shellTimeoutMarker opens the line both runtimes append as the last line
+// of a shell result that ran out of time.
 const shellTimeoutMarker = "[command timed out after"
 
-// NotRecorded lists facts the transcripts do not hold, so a reader of the
-// report does not take their absence for zero.
-var NotRecorded = []string{"launch_mode"}
+// runtimeNotePrefixes open user-role messages the runtime itself injects;
+// they do not start an operator turn.
+var runtimeNotePrefixes = []string{
+	"I ran this shell command myself:",          // `!` escape, both runtimes
+	"gem-agent: this session was resumed on",    // gem-agent resume note
+	"Runtime facts for this session:",           // lagent start, resume, /clear
+	"note from gem-agent:", "note from lagent:", // late-return notes
+}
+
+// NotRecorded explains, inside the report itself, what the transcripts do
+// not hold, so a reader does not take an absent item for zero.
+func NotRecorded() map[string]string {
+	return map[string]string{
+		"launch_mode": "how each run was started (-p, --auto, --allow) is not written to the transcripts",
+		"clear_count": "a /clear usually starts a new transcript without marking the old one, so it cannot be counted",
+	}
+}
 
 // Options steer what is counted.
 type Options struct {
@@ -111,7 +131,7 @@ func New(name string, opts Options) *Aggregator {
 			Shell:         Shell{ByLane: map[string]int{}},
 			Approvals:     Approvals{Auto: AutoApprovals{ByTier: map[string]int{}}, Gate: GateApprovals{BySource: map[string]int{}}},
 			Interventions: map[string]int{},
-			NotRecorded:   append([]string(nil), NotRecorded...),
+			NotRecorded:   NotRecorded(),
 		},
 		elapsed:    map[string][]float64{},
 		mcpServers: map[string]bool{},
@@ -124,6 +144,9 @@ func (a *Aggregator) Missing() { a.rt.Transcripts = "missing" }
 
 // Unreadable counts a transcript file that could not be opened or read.
 func (a *Aggregator) Unreadable() { a.rt.Anomalies.UnreadableFiles++ }
+
+// UnreadableDirs counts directories under the root that could not be read.
+func (a *Aggregator) UnreadableDirs(n int) { a.rt.Anomalies.UnreadableDirectories += n }
 
 func (a *Aggregator) inPeriod(t time.Time) bool {
 	return a.opts.Since.IsZero() || !t.Before(a.opts.Since)
@@ -156,56 +179,81 @@ func (a *Aggregator) Add(f transcript.File) {
 	a.rt.Versions[version(f.Header.Version)]++
 	a.rt.Models[closed(f.Header.Model, modelRe)]++
 
+	// Records before the period are still walked, uncounted, so a call
+	// made before the cutoff pairs with its result after it.
 	s := sessionState{a: a}
 	for _, r := range f.Records {
-		if !a.inPeriod(r.TS) {
-			continue
-		}
-		s.record(r)
+		s.record(r, a.inPeriod(r.TS))
 	}
 	s.finish()
 }
 
-// sessionState carries what spans records within one transcript.
-type sessionState struct {
-	a          *Aggregator
-	inTurn     bool
-	turnRounds int
-	pending    []string // tool names awaiting results, in call order
-	prevTS     time.Time
-	maxPrompt  int
-	sawUsage   bool
+// pendingCall is a tool call awaiting its result.
+type pendingCall struct {
+	name    string
+	counted bool
 }
 
+// sessionState carries what spans records within one transcript.
+type sessionState struct {
+	a           *Aggregator
+	inTurn      bool
+	turnRounds  int
+	pending     []pendingCall // in call order
+	prevTS      time.Time
+	maxPrompt   int
+	sawUsage    bool
+	autoAtStart bool
+	roAtStart   bool
+}
+
+// The message fields are decoded leniently: model-written arguments are
+// not schema-guaranteed, and one odd value must not lose the message.
 type toolCall struct {
-	Name string `json:"name"`
-	Args struct {
-		Access *string `json:"access"`
-	} `json:"args"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
 }
 
 type message struct {
-	Role      string     `json:"role"`
-	Content   string     `json:"content"`
-	ToolName  string     `json:"tool_name"`
-	ToolCalls []toolCall `json:"tool_calls"`
+	Role      string          `json:"role"`
+	Content   json.RawMessage `json:"content"`
+	ToolCalls []toolCall      `json:"tool_calls"`
 }
 
-func (s *sessionState) record(r transcript.Record) {
+// text returns a raw JSON string value, or "" for anything else.
+func text(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+func (s *sessionState) record(r transcript.Record, counted bool) {
 	a := s.a
 	rt := &a.rt
+	if !counted {
+		if r.Kind == "message" {
+			var m message
+			if json.Unmarshal(r.Data, &m) == nil {
+				s.message(r, m, false)
+			}
+		}
+		return
+	}
 	if !knownKinds[r.Kind] {
 		rt.Anomalies.UnknownRecordKinds++
 		return
 	}
+	unreadable := func() { rt.Anomalies.UnreadableLines++ }
 	switch r.Kind {
 	case "message":
 		var m message
 		if json.Unmarshal(r.Data, &m) != nil {
-			rt.Anomalies.UnreadableLines++
+			unreadable()
 			return
 		}
-		s.message(r, m)
+		s.message(r, m, true)
 	case "usage":
 		var u struct {
 			Source   *string `json:"source"`
@@ -215,7 +263,7 @@ func (s *sessionState) record(r transcript.Record) {
 			Cached   int     `json:"cached"`
 		}
 		if json.Unmarshal(r.Data, &u) != nil {
-			rt.Anomalies.UnreadableLines++
+			unreadable()
 			return
 		}
 		src := Unrecorded
@@ -233,16 +281,12 @@ func (s *sessionState) record(r transcript.Record) {
 		// main loop only; they count toward context size too.
 		if src == "main" || src == Unrecorded {
 			s.sawUsage = true
-			if u.Prompt > s.maxPrompt {
-				s.maxPrompt = u.Prompt
-			}
+			s.maxPrompt = max(s.maxPrompt, u.Prompt)
 			a.promptMain += u.Prompt
 			a.cachedMain += u.Cached
 		}
 	case "compaction":
 		rt.Context.Compactions++
-	case "clear":
-		rt.Sessions.Cleared++
 	case "resumed":
 		rt.Sessions.Resumed++
 	case "auto_decision":
@@ -252,7 +296,7 @@ func (s *sessionState) record(r transcript.Record) {
 			Model    bool   `json:"model"`
 		}
 		if json.Unmarshal(r.Data, &d) != nil {
-			rt.Anomalies.UnreadableLines++
+			unreadable()
 			return
 		}
 		if d.Approved {
@@ -271,7 +315,7 @@ func (s *sessionState) record(r transcript.Record) {
 			MustPrompt bool   `json:"must_prompt"`
 		}
 		if json.Unmarshal(r.Data, &d) != nil {
-			rt.Anomalies.UnreadableLines++
+			unreadable()
 			return
 		}
 		switch d.Decision {
@@ -279,6 +323,8 @@ func (s *sessionState) record(r transcript.Record) {
 			rt.Approvals.Gate.Approved++
 		case "denied":
 			rt.Approvals.Gate.Denied++
+		default:
+			rt.Approvals.Gate.OtherDecision++
 		}
 		rt.Approvals.Gate.BySource[closedSet(d.Source, gateSources)]++
 		if d.MustPrompt {
@@ -290,20 +336,24 @@ func (s *sessionState) record(r transcript.Record) {
 		var d struct {
 			Trigger string `json:"trigger"`
 		}
-		_ = json.Unmarshal(r.Data, &d)
+		if json.Unmarshal(r.Data, &d) != nil {
+			unreadable()
+			return
+		}
 		rt.Interventions[closedSet(d.Trigger, triggers)]++
 	case "mode_start":
+		// Written once per process, so a resumed session has several;
+		// the session counts once.
 		var d struct {
 			AutoApprove bool `json:"auto_approve"`
 			ReadOnly    bool `json:"read_only"`
 		}
-		_ = json.Unmarshal(r.Data, &d)
-		if d.AutoApprove {
-			rt.Modes.SessionsStartedAutoApprove++
+		if json.Unmarshal(r.Data, &d) != nil {
+			unreadable()
+			return
 		}
-		if d.ReadOnly {
-			rt.Modes.SessionsStartedReadOnly++
-		}
+		s.autoAtStart = s.autoAtStart || d.AutoApprove
+		s.roAtStart = s.roAtStart || d.ReadOnly
 	case "mode_change":
 		rt.Modes.ModeChanges++
 	case "assistant_empty":
@@ -311,58 +361,70 @@ func (s *sessionState) record(r transcript.Record) {
 	}
 }
 
-// runtimeNotePrefixes open user-role messages the runtime itself injects
-// (a `!` shell escape, a resume note); they do not start an operator turn.
-var runtimeNotePrefixes = []string{
-	"I ran this shell command myself:",
-	"gem-agent: this session was resumed on",
-	"lagent: this session was resumed on",
-}
-
-func (s *sessionState) message(r transcript.Record, m message) {
+func (s *sessionState) message(r transcript.Record, m message, counted bool) {
 	a := s.a
 	rt := &a.rt
 	switch m.Role {
 	case "user":
-		if hasAnyPrefix(m.Content, runtimeNotePrefixes) {
+		if hasAnyPrefix(text(m.Content), runtimeNotePrefixes) {
 			return
 		}
 		s.endTurn()
-		s.inTurn = true
+		// A turn opened before the period is not counted, nor are the
+		// rounds that answer it.
+		s.inTurn = counted
 	case "assistant":
-		if s.inTurn {
+		if s.inTurn && counted {
 			s.turnRounds++
 		}
 		if len(m.ToolCalls) == 0 {
 			return
 		}
-		rt.Tools.ResponsesWithCalls++
-		if len(m.ToolCalls) > 1 {
-			rt.Tools.MultiCallResponses++
+		if counted {
+			rt.Tools.ResponsesWithCalls++
+			if len(m.ToolCalls) > 1 {
+				rt.Tools.MultiCallResponses++
+			}
 		}
 		s.pending = s.pending[:0]
 		s.prevTS = r.TS
 		for _, c := range m.ToolCalls {
-			s.pending = append(s.pending, c.Name)
-			a.countCall(c)
+			s.pending = append(s.pending, pendingCall{name: c.Name, counted: counted})
+			if counted {
+				a.countCall(c)
+			}
 		}
 	case "tool":
 		if len(s.pending) == 0 {
-			rt.Anomalies.UnmatchedToolResults++
+			if counted {
+				rt.Anomalies.UnmatchedToolResults++
+			}
 			return
 		}
-		name := s.pending[0]
+		call := s.pending[0]
 		s.pending = s.pending[1:]
-		sec := r.TS.Sub(s.prevTS).Seconds()
-		if sec < 0 {
-			sec = 0
-		}
+		// The runtimes run a response's calls one after another, so each
+		// call's time runs from the previous result (from the response
+		// itself for the first call).
+		sec := max(r.TS.Sub(s.prevTS).Seconds(), 0)
 		s.prevTS = r.TS
-		a.recordElapsed(name, sec)
-		if name == "shell_exec" && strings.Contains(m.Content, shellTimeoutMarker) {
+		if !call.counted || !counted {
+			return
+		}
+		a.recordElapsed(call.name, sec)
+		if call.name == "shell_exec" && timedOut(text(m.Content)) {
 			rt.Shell.Timeouts++
 		}
 	}
+}
+
+// timedOut reports whether a shell result ends with the runtime's
+// timeout line (and not merely mentions it, as a grep of the runtime's
+// own source would).
+func timedOut(content string) bool {
+	content = strings.TrimRight(content, "\n")
+	last := content[strings.LastIndexByte(content, '\n')+1:]
+	return strings.HasPrefix(last, shellTimeoutMarker) && strings.HasSuffix(last, "]")
 }
 
 func (s *sessionState) endTurn() {
@@ -377,6 +439,12 @@ func (s *sessionState) finish() {
 	s.endTurn()
 	if s.sawUsage {
 		s.a.maxPrompt = append(s.a.maxPrompt, float64(s.maxPrompt))
+	}
+	if s.autoAtStart {
+		s.a.rt.Modes.SessionsAutoApproveAtStart++
+	}
+	if s.roAtStart {
+		s.a.rt.Modes.SessionsReadOnlyAtStart++
 	}
 }
 
@@ -402,18 +470,33 @@ func (a *Aggregator) countCall(c toolCall) {
 	st.Calls++
 	rt.Tools.Builtin[c.Name] = st
 	if c.Name == "shell_exec" {
-		lane := Unrecorded
-		if c.Args.Access != nil {
-			switch v := *c.Args.Access; {
-			case shellLanes[v]:
-				lane = v
-			case strings.HasPrefix(v, "unconfined"):
-				lane = "unconfined"
-			default:
-				lane = Other
-			}
-		}
-		rt.Shell.ByLane[lane]++
+		rt.Shell.ByLane[shellLane(c.Args)]++
+	}
+}
+
+// shellLane reads the lane a shell call declared. A missing lane is
+// unrecorded (older runtimes); a value that is not a known lane — or not
+// a string at all — is other.
+func shellLane(args json.RawMessage) string {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(args, &fields) != nil {
+		return Other
+	}
+	raw, ok := fields["access"]
+	if !ok {
+		return Unrecorded
+	}
+	var v string
+	if json.Unmarshal(raw, &v) != nil {
+		return Other
+	}
+	switch {
+	case shellLanes[v]:
+		return v
+	case strings.HasPrefix(v, "unconfined:"):
+		return "unconfined"
+	default:
+		return Other
 	}
 }
 
@@ -479,10 +562,16 @@ func round(x float64, places int) float64 {
 }
 
 func version(v string) string {
-	if untaggedRe.MatchString(v) {
+	switch {
+	case v == "":
+		return Unrecorded
+	case v == "dev" || untaggedRe.MatchString(v):
 		return "dev"
+	case versionRe.MatchString(v):
+		return v
+	default:
+		return Other
 	}
-	return closed(v, versionRe)
 }
 
 func closed(v string, re *regexp.Regexp) string {

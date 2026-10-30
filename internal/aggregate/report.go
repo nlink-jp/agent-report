@@ -42,7 +42,7 @@ type Runtime struct {
 	Interventions       map[string]int         `json:"interventions"` // per trigger
 	Modes               Modes                  `json:"modes"`
 	EmptyModelResponses int                    `json:"empty_model_responses"`
-	NotRecorded         []string               `json:"not_recorded"`
+	NotRecorded         map[string]string      `json:"not_recorded"` // item → why it is absent
 	Anomalies           Anomalies              `json:"anomalies"`
 }
 
@@ -50,7 +50,6 @@ type Runtime struct {
 type Sessions struct {
 	Count   int `json:"count"`
 	Resumed int `json:"resumed"`
-	Cleared int `json:"cleared"`
 }
 
 // Dist is a distribution summary.
@@ -84,9 +83,11 @@ type TokenBucket struct {
 	Cached   int `json:"cached"`
 }
 
-// ToolStat is one tool's calls. Elapsed runs from the model response that
-// asked for the call to the call's result, so it includes any time spent
-// waiting for an approval.
+// ToolStat is one tool's calls. Elapsed runs from the end of the previous
+// call in the same model response (from the response itself for the first
+// call) to this call's result: the runtimes run a response's calls one
+// after another, so it is the call's own time, including any time spent
+// waiting for an approval or an answer.
 type ToolStat struct {
 	Calls      int  `json:"calls"`
 	ElapsedSec Dist `json:"elapsed_sec"`
@@ -134,25 +135,28 @@ type AutoApprovals struct {
 
 // GateApprovals are decisions taken at the approval prompt.
 type GateApprovals struct {
-	Approved   int            `json:"approved"`
-	Denied     int            `json:"denied"`
-	BySource   map[string]int `json:"by_source"`
-	MustPrompt int            `json:"must_prompt"`
+	Approved      int            `json:"approved"`
+	Denied        int            `json:"denied"`
+	OtherDecision int            `json:"other_decision"`
+	BySource      map[string]int `json:"by_source"`
+	MustPrompt    int            `json:"must_prompt"`
 }
 
-// Modes counts session modes.
+// Modes counts session modes. A session counts once even when it was
+// resumed and started again.
 type Modes struct {
-	SessionsStartedAutoApprove int `json:"sessions_started_auto_approve"`
-	SessionsStartedReadOnly    int `json:"sessions_started_read_only"`
+	SessionsAutoApproveAtStart int `json:"sessions_auto_approve_at_start"`
+	SessionsReadOnlyAtStart    int `json:"sessions_read_only_at_start"`
 	ModeChanges                int `json:"mode_changes"`
 }
 
 // Anomalies are what the reader could not use.
 type Anomalies struct {
-	UnreadableFiles      int `json:"unreadable_files"`
-	FilesWithoutHeader   int `json:"files_without_header"`
-	UnsupportedSchema    int `json:"unsupported_schema"`
-	UnreadableLines      int `json:"unreadable_lines"`
-	UnknownRecordKinds   int `json:"unknown_record_kinds"`
-	UnmatchedToolResults int `json:"unmatched_tool_results"`
+	UnreadableDirectories int `json:"unreadable_directories"`
+	UnreadableFiles       int `json:"unreadable_files"`
+	FilesWithoutHeader    int `json:"files_without_header"`
+	UnsupportedSchema     int `json:"unsupported_schema"`
+	UnreadableLines       int `json:"unreadable_lines"`
+	UnknownRecordKinds    int `json:"unknown_record_kinds"`
+	UnmatchedToolResults  int `json:"unmatched_tool_results"`
 }
