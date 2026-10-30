@@ -16,7 +16,7 @@ NOTARY_PROFILE    ?= nlink-jp-notary
 # four-target standard).
 PLATFORMS := darwin/arm64
 
-.PHONY: build build-all package verify-release test vet clean
+.PHONY: build build-all package verify-release test vet vuln clean
 
 ## build: compile the binary into dist/ (never use `go build` directly)
 build:
@@ -77,6 +77,10 @@ test:
 ## vet: static checks
 vet:
 	go vet ./...
+
+## vuln: known vulnerabilities in the standard library this toolchain builds with
+vuln:
+	govulncheck ./...
 
 ## clean: remove build artifacts
 clean:

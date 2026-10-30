@@ -8,6 +8,13 @@ dist/
 # Credentials
 .env
 
+# Real transcripts used for local checks — never committed
+testdata/real/
+*.local.jsonl
+
+# Claude Code
+.claude/
+
 # macOS
 .DS_Store
 
