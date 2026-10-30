@@ -4,8 +4,6 @@ A usage summary of [gem-agent](https://github.com/nlink-jp/gem-agent) and
 [lagent](https://github.com/nlink-jp/lagent) sessions, made on your own
 machine for you to attach to a report.
 
-> **Not yet released.** See the [RFP](docs/en/agent-report-rfp.md) for the plan.
-
 [日本語版 README](README.ja.md)
 
 ## Why
@@ -25,7 +23,8 @@ server and tool counts.
   then hand it over yourself.
 - **Read only.** Transcripts are never written, moved or deleted.
 - **What is not recorded is said to be not recorded.** For example, how a run
-  was launched (`-p`, `--auto`) is not in the transcripts, so the report says so.
+  was launched (`-p`, `--auto`) is not in the transcripts, so the report says
+  so, and says why.
 
 ## Usage
 
@@ -33,50 +32,65 @@ server and tool counts.
 agent-report                          # both runtimes, last 30 days, as a table
 agent-report --runtime lagent --since all
 agent-report --json > report.json     # the same items as JSON
+agent-report version                  # same as --version
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--runtime gem-agent\|lagent\|all` | `all` | Runtime to report on |
-| `--since <n>d\|YYYY-MM-DD\|all` | `30d` | Period to count |
+| `--since <n>d\|YYYY-MM-DD\|all` | `30d` | Period to count (a date is midnight in your local time) |
 | `--json` | off | Emit JSON instead of the table |
 | `--mcp-names` | off | Include call counts per MCP server name |
 | `--sessions-dir <path>` | each runtime's default | Read transcripts from another directory (single `--runtime` only) |
 | `--version` | | Print the version |
 
 Default transcript locations: `~/.local/state/gem-agent/sessions` and
-`~/.local/state/lagent/sessions`.
+`~/.local/state/lagent/sessions`. A runtime whose default location does not
+exist is reported as `missing`; a `--sessions-dir` that does not exist is an
+error.
 
 Exit codes: `0` success, `1` runtime error, `2` usage error.
 
 ## What the report holds
 
-Per runtime:
+At the top: `schema` (the report format version), `tool`, `tool_version`, and
+`period` (`since` and `until`, in UTC — the report does not carry your time
+zone). Then, per runtime:
 
 | Section | Items |
 |---|---|
 | `transcripts` | `found` or `missing` (the path itself is never printed) |
-| `sessions` | sessions with activity in the period, resumed, cleared |
+| `sessions` | sessions with activity in the period, resumes |
 | `versions`, `models` | sessions per runtime version and per model |
 | `turns` | operator turns and rounds per turn (n / p50 / p90 / max) |
 | `context` | largest prompt per session, cached share of prompt, compactions |
 | `tokens` | calls and tokens per call source (main loop, risk review, …) |
-| `tools` | responses with calls, responses with several calls, calls and elapsed seconds per built-in tool, calls to unknown names, MCP calls / servers / tools |
-| `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded), timeouts |
+| `tools` | responses with calls, responses with several calls, calls and elapsed seconds per built-in tool, calls to unknown names, MCP calls / servers / tools / elapsed seconds |
+| `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded / other), timeouts |
 | `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, hook denials |
 | `interventions` | round-limit and loop interventions |
-| `modes` | sessions started with auto-approve or read-only, mode changes |
-| `not_recorded` | facts the transcripts do not hold (`launch_mode`) |
-| `anomalies` | unreadable files and lines, missing headers, unsupported schema, unknown record kinds, unmatched tool results |
+| `modes` | sessions that started with auto-approve or read-only (counted once per session, resumes included), mode changes |
+| `empty_model_responses` | model responses that came back empty |
+| `not_recorded` | facts the transcripts do not hold, each with the reason |
+| `anomalies` | unreadable directories, files and lines, missing headers, unsupported schema, unknown record kinds, unmatched tool results |
 
 Strings from a transcript appear only when they belong to a closed set: an
 enumerated value the runtimes write, a known built-in tool name, or a
-version, model or MCP server name that matches a strict pattern. Anything
-else is counted under `other` (or `unrecorded` when the field is absent).
+version, model or MCP server name that matches a narrow pattern — a version
+is a release tag or `git describe` output (a bare commit hash is shown as
+`dev`), a model is an id with at most one publisher prefix (`google/…`).
+Anything else is counted under `other` (or `unrecorded` when the field is
+absent). A model id you chose yourself is shown as you wrote it, so read the
+`models` section before you send the report.
 
-Elapsed seconds run from the model response that asked for a call to that
-call's result, so they include time spent waiting for an approval or for
-your answer to `ask_user`.
+Turns start at a message you typed; the messages the runtimes inject (session
+facts, resume notes, `!` shell escapes, notes about interrupted calls) do not
+start one.
+
+The runtimes run the calls of one model response one after another. A call's
+elapsed seconds run from the end of the previous call in that response (from
+the response itself for the first call) to the call's result, so they include
+time spent waiting for an approval or for your answer to `ask_user`.
 
 The table and `--json` are drawn from the same data; the table is the JSON
 laid out as indented lines.
@@ -90,7 +104,12 @@ macOS on Apple Silicon only, like the two runtimes whose transcripts it reads.
 ```sh
 make build    # outputs dist/agent-report
 make test
+make vuln     # govulncheck
 ```
+
+## Documents
+
+- [RFP](docs/en/agent-report-rfp.md) — the specification and the decisions behind it
 
 ## License
 

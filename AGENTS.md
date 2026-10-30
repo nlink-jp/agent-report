@@ -5,8 +5,7 @@
 A util-series CLI that reads the session transcripts of gem-agent and lagent
 on the user's machine and prints a fixed set of numeric items — a usage
 summary a third party can inspect and attach to a report. It sends nothing and
-emits no free text from the transcripts. Status: RFP Phase 1 implemented,
-not yet released.
+emits no free text from the transcripts.
 
 ## Build & test
 
@@ -14,6 +13,7 @@ not yet released.
 make build    # → dist/agent-report (signed when a Developer ID cert is present)
 make test     # or: go test ./...
 make vet
+make vuln     # govulncheck
 make package  # darwin-arm64 zip + notarization (release only)
 make verify-release
 ```
@@ -55,23 +55,45 @@ does, and gem-usage-lens is its other consumer.
   `--allow`); report it as not recorded.
 - **Closed sets, not redaction.** A string from a transcript reaches the
   report only as an enumerated value, a name on `BuiltinTools`, or a name
-  that matches `versionRe` / `modelRe` / `serverRe`; else `other`. A new
+  that matches `versionRe` / `modelRe` / `serverRe`; else `other`. The
+  patterns are deliberately narrow (a version is a tag or `git describe`
+  output; a model id has at most one `/` and no `@`) — a character-set
+  pattern let GCP resource paths and e-mail addresses through. A model id
+  the user chose is still shown as written; that residue is accepted and the
+  README tells the user to read the `models` section before sending. A new
   report item that needs a string must fit one of these. The leak test in
-  `cmd/root_test.go` plants a marker in every free-text field — extend it
-  when a new field is read.
+  `cmd/root_test.go` plants a marker in every free-text field of a gem-agent
+  and a lagent transcript, including values a looser pattern would pass —
+  extend it when a new field is read. Mutating `modelRe` back to a
+  character-set pattern, or passing an unknown lane through, makes it fail.
 - **New runtime record kinds** show up as `anomalies.unknown_record_kinds`;
   add the kind to `knownKinds` (and count it if it matters).
 - **New built-in tools** in either runtime show up as
   `tools.unknown_name_calls`; add the name to `BuiltinTools`. Models also
   invent names (`default_api:write_file`, `mcp__web-fetch` with no tool) —
   those stay unknown.
-- **Elapsed seconds** run from the assistant message that asked for the call
-  to its result, results matched to calls in order. They include approval
-  waits; `ask_user` can show hours.
+- **Elapsed seconds**: both runtimes run a response's calls sequentially and
+  write results in call order, so results are matched to calls in order and
+  a call's time runs from the previous result (from the response for the
+  first call). It includes approval waits; `ask_user` can show hours.
+- **The period**: records before `--since` are still walked, uncounted, so a
+  call before the cutoff pairs with its result after it. Report times are UTC.
 - **Records written before gem-agent ADR-0057** carry no `source`; they are
   counted under `unrecorded` and treated as main-loop calls for context size.
 - **Turns**: a user-role message starts one, except the runtime's own
-  injected notes (`!` shell escape, resume note).
+  injected messages, matched by prefix in `runtimeNotePrefixes`: the `!`
+  shell escape, gem-agent's resume note, lagent's "Runtime facts for this
+  session:" (written at start, resume and /clear), and both runtimes'
+  "note from <runtime>:" late-return notes. A new injected message in either
+  runtime inflates turns until its prefix is added.
+- **Lenient decoding**: message content and tool arguments are decoded as raw
+  JSON; a model writing a non-string `access` must not lose the message.
+- **/clear is not countable**: gem-agent's normal /clear opens a new file and
+  writes no record, so the report lists it under `not_recorded`.
+- **`mode_start` is written once per process**, so a resumed session has
+  several; modes count once per session.
+- **A missing `--sessions-dir` is an error** (exit 1, path not echoed); a
+  missing default location is `missing`.
 
 ## Design reference
 
