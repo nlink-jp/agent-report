@@ -26,6 +26,16 @@ server and tool counts.
   was launched (`-p`, `--auto`) is not in the transcripts, so the report says
   so, and says why.
 
+## Install
+
+```sh
+brew install nlink-jp/tap/agent-report
+```
+
+Or download `agent-report-v<version>-darwin-arm64.zip` from the
+[releases page](https://github.com/nlink-jp/agent-report/releases) — Developer ID
+signed and Apple-notarized.
+
 ## Usage
 
 ```sh

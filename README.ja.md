@@ -22,6 +22,16 @@ gem-agent や lagent の不具合を報告しても、開発側からはあな�
 - **記録にないことは「記録なし」と出す。** たとえば起動の仕方（`-p`、`--auto`）は
   記録に残っていないので、そのことと理由を出力に書きます。
 
+## インストール
+
+```sh
+brew install nlink-jp/tap/agent-report
+```
+
+または [リリースページ](https://github.com/nlink-jp/agent-report/releases) から
+`agent-report-v<version>-darwin-arm64.zip` を取得してください（Developer ID 署名・
+Apple の公証済み）。
+
 ## 使い方
 
 ```sh
