@@ -10,10 +10,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nlink-jp/agent-report/internal/aggregate"
+	"github.com/nlink-jp/agent-report/internal/render"
+	"github.com/nlink-jp/agent-report/internal/transcript"
 )
 
 // Runtimes the tool reads, in report order.
@@ -75,7 +81,12 @@ func run(args []string, version string, now time.Time, stdout, stderr io.Writer)
 	opts.JSON = *asJSON
 	opts.MCPNames = *mcpNames
 
-	if err := report(opts, stdout); err != nil {
+	home, err := os.UserHomeDir()
+	if err != nil && opts.SessionsDir == "" {
+		fmt.Fprintf(stderr, "error: cannot find the home directory: %v\n", err)
+		return 1
+	}
+	if err := report(opts, version, now, home, stdout); err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
 	}
@@ -130,12 +141,56 @@ func parseSince(s string, now time.Time) (time.Time, error) {
 	return t, nil
 }
 
-// report reads the transcripts and writes the summary. The reading and
-// aggregation arrive in Phase 1 (RFP §4).
-func report(opts Options, w io.Writer) error {
-	_ = opts
-	_ = w
-	return errors.New("not implemented yet")
+// sessionsDir is where a runtime keeps its transcripts.
+func sessionsDir(home, runtime string) string {
+	return filepath.Join(home, ".local", "state", runtime, "sessions")
+}
+
+// report reads the transcripts and writes the summary. Paths never reach
+// the output: a missing directory is reported as "missing", an unreadable
+// file as a count.
+func report(opts Options, version string, now time.Time, home string, w io.Writer) error {
+	rep := aggregate.Report{
+		Schema:      aggregate.SchemaVersion,
+		Tool:        "agent-report",
+		ToolVersion: version,
+		Period:      aggregate.Period{Until: now.Format(time.RFC3339)},
+	}
+	if !opts.Since.IsZero() {
+		rep.Period.Since = opts.Since.Format(time.RFC3339)
+	}
+	for _, rt := range opts.Runtimes {
+		dir := opts.SessionsDir
+		if dir == "" {
+			dir = sessionsDir(home, rt)
+		}
+		rep.Runtimes = append(rep.Runtimes, collect(rt, dir, opts))
+	}
+	if opts.JSON {
+		return render.JSON(w, rep)
+	}
+	return render.Table(w, rep)
+}
+
+func collect(runtime, dir string, opts Options) aggregate.Runtime {
+	agg := aggregate.New(runtime, aggregate.Options{Since: opts.Since, MCPNames: opts.MCPNames})
+	files, err := transcript.Discover(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		agg.Missing()
+		return agg.Result()
+	}
+	if err != nil {
+		agg.Unreadable()
+	}
+	for _, path := range files {
+		f, err := transcript.ReadFile(path)
+		if err != nil {
+			agg.Unreadable()
+			continue
+		}
+		agg.Add(f)
+	}
+	return agg.Result()
 }
 
 // versionLine is what both `version` and `--version` print — identical, so

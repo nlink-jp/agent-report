@@ -2,9 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nlink-jp/agent-report/internal/aggregate"
 )
 
 var fixedNow = time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
@@ -91,9 +96,127 @@ func TestParseSince(t *testing.T) {
 	}
 }
 
-func TestReportNotImplementedIsRuntimeError(t *testing.T) {
-	code, _, stderr := runCLI()
-	if code != 1 || !strings.Contains(stderr, "not implemented") {
-		t.Fatalf("exit %d, stderr %q", code, stderr)
+// marker is planted in every free-text field a transcript has. It must
+// never reach the output, in either format.
+const marker = "ZQXSECRET"
+
+// plantTranscripts writes a gem-agent transcript under a fake home whose
+// every free-text field carries the marker, and returns the home.
+func plantTranscripts(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	dir := filepath.Join(home, ".local", "state", "gem-agent", "sessions", "projects", "-Users-"+marker)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"ts":"2026-10-29T10:00:00Z","kind":"session","data":{"schema":2,"version":"v0.94.0 ` + marker + `","model":"/Users/` + marker + `/model","project":"/Users/` + marker + `","location":"global"}}`,
+		`{"ts":"2026-10-29T10:00:01Z","kind":"message","data":{"role":"user","content":"` + marker + ` please","attachments":[{"ref":"` + marker + `","kind":"hook","content":"` + marker + `"}]}}`,
+		`{"ts":"2026-10-29T10:00:02Z","kind":"message","data":{"role":"assistant","content":"` + marker + `","tool_calls":[` +
+			`{"id":"c1","name":"shell_exec","args":{"command":"cat /Users/` + marker + `/.env","access":"read","gem_agent_purpose":"` + marker + `"}},` +
+			`{"id":"c2","name":"mcp__` + marker + ` server__q","args":{"q":"` + marker + `"}},` +
+			`{"id":"c3","name":"mcp__whois-lookup__lookup","args":{"query":"` + marker + `.example"}},` +
+			`{"id":"c4","name":"` + marker + `_tool","args":{}}]}}`,
+		`{"ts":"2026-10-29T10:00:05Z","kind":"message","data":{"role":"tool","tool_name":"shell_exec","tool_call_id":"c1","content":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T10:00:06Z","kind":"auto_decision","data":{"approved":true,"name":"shell_exec","reason":"` + marker + `","tier":"` + marker + `","key":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T10:00:07Z","kind":"gate_decision","data":{"decision":"denied","detail":"` + marker + `","deny_reason":"` + marker + `","source":"` + marker + `","name":"x"}}`,
+		`{"ts":"2026-10-29T10:00:08Z","kind":"round_intervention","data":{"trigger":"` + marker + `","detail":"` + marker + `","reason":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T10:00:09Z","kind":"notice","data":{"message":"` + marker + `"}}`,
+		`{"ts":"2026-10-29T10:00:10Z","kind":"usage","data":{"source":"` + marker + `","model":"` + marker + `","prompt":10}}`,
+		`{"ts":"2026-10-29T10:00:11Z","kind":"` + marker + `","data":{"x":"` + marker + `"}}`,
+		marker + ` not json`,
+	}
+	if err := os.WriteFile(filepath.Join(dir, marker+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+func TestNoTranscriptTextReachesTheOutput(t *testing.T) {
+	t.Setenv("HOME", plantTranscripts(t))
+	for _, args := range [][]string{
+		{"--since", "all"},
+		{"--since", "all", "--json"},
+		{"--since", "all", "--mcp-names"},
+		{"--since", "all", "--mcp-names", "--json"},
+	} {
+		code, stdout, stderr := runCLI(args...)
+		if code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, stderr)
+		}
+		if strings.Contains(stdout, marker) || strings.Contains(stderr, marker) {
+			t.Errorf("%v: transcript text leaked into the output:\n%s", args, stdout)
+		}
+	}
+}
+
+func TestReportCountsAndMissingRuntime(t *testing.T) {
+	t.Setenv("HOME", plantTranscripts(t))
+	code, stdout, _ := runCLI("--since", "all", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var rep aggregate.Report
+	if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Runtimes) != 2 || rep.Runtimes[0].Name != "gem-agent" || rep.Runtimes[1].Name != "lagent" {
+		t.Fatalf("runtimes = %+v", rep.Runtimes)
+	}
+	g, l := rep.Runtimes[0], rep.Runtimes[1]
+	if g.Transcripts != "found" || l.Transcripts != "missing" {
+		t.Errorf("transcripts = %s, %s; want found, missing", g.Transcripts, l.Transcripts)
+	}
+	if g.Sessions.Count != 1 || g.Tools.MCP.Calls != 2 || g.Tools.UnknownNameCalls != 1 ||
+		g.Shell.ByLane["read"] != 1 || g.Anomalies.UnknownRecordKinds != 1 || g.Anomalies.UnreadableLines != 1 {
+		t.Errorf("gem-agent = %+v", g)
+	}
+	if rep.Period.Since != "" {
+		t.Errorf("since = %q; want empty for all time", rep.Period.Since)
+	}
+}
+
+func TestMCPNamesOnlyOnRequest(t *testing.T) {
+	t.Setenv("HOME", plantTranscripts(t))
+	_, without, _ := runCLI("--since", "all")
+	_, with, _ := runCLI("--since", "all", "--mcp-names")
+	if strings.Contains(without, "whois-lookup") {
+		t.Error("an MCP server name appeared without --mcp-names")
+	}
+	if !strings.Contains(with, "whois-lookup: 1") {
+		t.Errorf("--mcp-names did not list the server:\n%s", with)
+	}
+}
+
+func TestSessionsDirOverride(t *testing.T) {
+	home := plantTranscripts(t)
+	t.Setenv("HOME", t.TempDir()) // the default location is now empty
+	dir := filepath.Join(home, ".local", "state", "gem-agent", "sessions")
+	code, stdout, _ := runCLI("--runtime", "gem-agent", "--sessions-dir", dir, "--since", "all", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var rep aggregate.Report
+	if err := json.Unmarshal([]byte(stdout), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Runtimes) != 1 || rep.Runtimes[0].Sessions.Count != 1 {
+		t.Errorf("runtimes = %+v", rep.Runtimes)
+	}
+}
+
+func TestDefaultPeriodExcludesOldSessions(t *testing.T) {
+	t.Setenv("HOME", plantTranscripts(t))
+	// fixedNow is 2026-10-30; the planted session is 2026-10-29.
+	var out bytes.Buffer
+	if code := run([]string{"--json"}, "v", fixedNow.AddDate(0, 2, 0), &out, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var rep aggregate.Report
+	if err := json.Unmarshal(out.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Runtimes[0].Sessions.Count != 0 {
+		t.Errorf("a session two months old was counted under the default 30 days")
 	}
 }
