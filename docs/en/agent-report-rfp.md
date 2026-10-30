@@ -74,7 +74,7 @@ None. Go standard library only; no network access.
 
 ### Phase 2: Features
 
-- `--mcp-names`
+- `--mcp-names` (small enough to be brought forward into Phase 1)
 - Configuration reading, with defined items, only if using the Phase 1 output in real reports shows a need
 
 ### Phase 3: Release

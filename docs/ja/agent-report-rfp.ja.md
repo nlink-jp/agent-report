@@ -74,7 +74,7 @@ agent-report [--runtime gem-agent|lagent|all] [--since <期間>] [--json]
 
 ### Phase 2: 追加機能
 
-- `--mcp-names`
+- `--mcp-names`（実装が小さいため Phase 1 に前倒しで含めた）
 - 設定ファイルの読み取りは、Phase 1 の出力を実際の報告に使ってみて必要が見えた場合だけ、項目を決めて足す
 
 ### Phase 3: リリース

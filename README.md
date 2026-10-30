@@ -4,9 +4,7 @@ A usage summary of [gem-agent](https://github.com/nlink-jp/gem-agent) and
 [lagent](https://github.com/nlink-jp/lagent) sessions, made on your own
 machine for you to attach to a report.
 
-> **In development.** The command line is in place; reading and counting the
-> transcripts is not implemented yet. See the [RFP](docs/en/agent-report-rfp.md)
-> for the plan.
+> **Not yet released.** See the [RFP](docs/en/agent-report-rfp.md) for the plan.
 
 [日本語版 README](README.ja.md)
 
@@ -50,6 +48,38 @@ Default transcript locations: `~/.local/state/gem-agent/sessions` and
 `~/.local/state/lagent/sessions`.
 
 Exit codes: `0` success, `1` runtime error, `2` usage error.
+
+## What the report holds
+
+Per runtime:
+
+| Section | Items |
+|---|---|
+| `transcripts` | `found` or `missing` (the path itself is never printed) |
+| `sessions` | sessions with activity in the period, resumed, cleared |
+| `versions`, `models` | sessions per runtime version and per model |
+| `turns` | operator turns and rounds per turn (n / p50 / p90 / max) |
+| `context` | largest prompt per session, cached share of prompt, compactions |
+| `tokens` | calls and tokens per call source (main loop, risk review, …) |
+| `tools` | responses with calls, responses with several calls, calls and elapsed seconds per built-in tool, calls to unknown names, MCP calls / servers / tools |
+| `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded), timeouts |
+| `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, hook denials |
+| `interventions` | round-limit and loop interventions |
+| `modes` | sessions started with auto-approve or read-only, mode changes |
+| `not_recorded` | facts the transcripts do not hold (`launch_mode`) |
+| `anomalies` | unreadable files and lines, missing headers, unsupported schema, unknown record kinds, unmatched tool results |
+
+Strings from a transcript appear only when they belong to a closed set: an
+enumerated value the runtimes write, a known built-in tool name, or a
+version, model or MCP server name that matches a strict pattern. Anything
+else is counted under `other` (or `unrecorded` when the field is absent).
+
+Elapsed seconds run from the model response that asked for a call to that
+call's result, so they include time spent waiting for an approval or for
+your answer to `ask_user`.
+
+The table and `--json` are drawn from the same data; the table is the JSON
+laid out as indented lines.
 
 ## Supported platform
 
