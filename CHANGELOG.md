@@ -24,8 +24,8 @@ These fields are added to report schema 1; nothing was renamed or removed.
 
 ### Fixed
 
-- gem-agent's `connection_lost` and lagent's `window_full` records were
-  counted as unknown record kinds.
+- gem-agent's `connection_lost` and `library_log` and lagent's
+  `window_full` records were counted as unknown record kinds.
 
 ## [0.1.0] - 2026-10-30
 

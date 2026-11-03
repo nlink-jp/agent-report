@@ -69,7 +69,7 @@ var knownKinds = setOf(
 	"mcp_fault", "skills_reload", "persistent_changes", "added_directories",
 	"tool_late_return", "tool_excluded", "tool_not_advertised",
 	"tool_skipped", "assistant_empty", "riskbook_update",
-	"connection_lost", "window_full",
+	"connection_lost", "window_full", "library_log",
 )
 
 var (
