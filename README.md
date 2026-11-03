@@ -76,7 +76,7 @@ zone). Then, per runtime:
 | `context` | largest prompt per session, cached share of prompt, compactions |
 | `tokens` | calls and tokens per call source (main loop, risk review, …) |
 | `tools` | responses with calls, responses with several calls (and, by kind, their calls and the seconds they took one after another and would have taken at once), calls and elapsed / run seconds per built-in tool, calls to unknown names, MCP calls / servers / tools / elapsed / run seconds |
-| `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded / other), timeouts |
+| `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded / other — `unrecorded` is a call that named no lane), timeouts |
 | `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, seconds spent waiting for your answer at the prompt, hook denials |
 | `interventions` | round-limit and loop interventions |
 | `modes` | sessions that started with auto-approve or read-only (counted once per session, resumes included), mode changes |

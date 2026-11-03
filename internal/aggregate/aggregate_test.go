@@ -588,3 +588,17 @@ func TestCeilingRefusalHasNoRunTime(t *testing.T) {
 		t.Errorf("elapsed %+v run %+v; want elapsed n=1, run n=0", st.ElapsedSec, st.RunSec)
 	}
 }
+
+func TestShellLaneIsReadLikeTheRuntimes(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(1, "message", calls(
+			call("shell_exec", map[string]any{"access": " Read "}),
+			call("shell_exec", map[string]any{"access": "WRITE"}),
+			call("shell_exec", map[string]any{"access": ""}),
+		))
+	rt := run(Options{}, s.f)
+	if want := map[string]int{"read": 1, "write": 1, Unrecorded: 1}; !equal(rt.Shell.ByLane, want) {
+		t.Errorf("lanes = %v; want %v", rt.Shell.ByLane, want)
+	}
+}

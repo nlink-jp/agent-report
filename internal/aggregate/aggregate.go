@@ -666,9 +666,11 @@ func (a *Aggregator) addGroup(g *openGroup) {
 	sum.ifParallel += g.longest
 }
 
-// shellLane reads the lane a shell call declared. A missing lane is
-// unrecorded (older runtimes); a value that is not a known lane — or not
-// a string at all — is other.
+// shellLane reads the lane a shell call declared, the way the runtimes'
+// ParseLane does: case and surrounding space do not matter. A missing or
+// empty lane is unrecorded — the call named none (where lanes exist it
+// ran in the read lane; see laneDefaultRead); a value that is not a known
+// lane — or not a string at all — is other.
 func shellLane(args json.RawMessage) string {
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(args, &fields) != nil {
@@ -682,7 +684,10 @@ func shellLane(args json.RawMessage) string {
 	if json.Unmarshal(raw, &v) != nil {
 		return Other
 	}
+	v = strings.ToLower(strings.TrimSpace(v))
 	switch {
+	case v == "":
+		return Unrecorded
 	case shellLanes[v]:
 		return v
 	case strings.HasPrefix(v, "unconfined:"):

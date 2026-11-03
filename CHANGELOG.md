@@ -26,6 +26,9 @@ These fields are added to report schema 1; nothing was renamed or removed.
 
 - gem-agent's `connection_lost` and `library_log` and lagent's
   `window_full` records were counted as unknown record kinds.
+- A shell lane written in another case or with surrounding space (`"Read"`)
+  was counted as `other`, and an empty one as `other` rather than
+  `unrecorded`; lanes are now read the way the runtimes read them.
 
 ## [0.1.0] - 2026-10-30
 
