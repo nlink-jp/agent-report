@@ -371,3 +371,14 @@ func TestUnreadableDecisionRecordsAreCounted(t *testing.T) {
 		t.Errorf("anomalies %+v interventions %v modes %+v", rt.Anomalies, rt.Interventions, rt.Modes)
 	}
 }
+
+func TestEveryKindTheRuntimesWriteIsKnown(t *testing.T) {
+	// gem-agent writes connection_lost when the model connection drops
+	// mid-round; lagent writes window_full when the context fills.
+	s := newSession("v0.94.0", "m").
+		add(1, "connection_lost", map[string]any{"round": 1}).
+		add(2, "window_full", map[string]any{"round": 2})
+	if rt := run(Options{}, s.f); rt.Anomalies.UnknownRecordKinds != 0 {
+		t.Errorf("unknown kinds = %d; want 0", rt.Anomalies.UnknownRecordKinds)
+	}
+}

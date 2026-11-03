@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- gem-agent's `connection_lost` and lagent's `window_full` records were
+  counted as unknown record kinds.
+
 ## [0.1.0] - 2026-10-30
 
 ### Added
