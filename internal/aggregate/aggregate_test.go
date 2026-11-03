@@ -382,3 +382,207 @@ func TestEveryKindTheRuntimesWriteIsKnown(t *testing.T) {
 		t.Errorf("unknown kinds = %d; want 0", rt.Anomalies.UnknownRecordKinds)
 	}
 }
+
+func TestRunTimeLeavesOutApprovalWait(t *testing.T) {
+	mcp := "mcp__srv__get"
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(10, "message", calls(call(mcp, nil), call(mcp, nil), call(mcp, nil), call("read_file", nil))).
+		// first: risk review, then the operator answers after a long wait
+		add(13, "auto_decision", map[string]any{"name": mcp, "approved": false, "tier": "review"}).
+		add(70, "gate_decision", map[string]any{"name": mcp, "decision": "approved", "source": "operator"}).
+		add(72, "message", result(mcp, "a")).
+		// second: the allowlist answers at once — no operator wait
+		add(73, "gate_decision", map[string]any{"name": mcp, "decision": "approved", "source": "allowlist"}).
+		add(74, "message", result(mcp, "b")).
+		// third: the operator denies it, so it never ran
+		add(80, "gate_decision", map[string]any{"name": mcp, "decision": "denied", "source": "operator"}).
+		add(80.5, "message", result(mcp, "denied")).
+		// fourth: no decision at all, so run equals elapsed
+		add(82.5, "message", result("read_file", "x")).
+		add(83, "message", answer())
+
+	rt := run(Options{}, s.f)
+	m := rt.Tools.MCP
+	if m.ElapsedSec.N != 3 || m.ElapsedSec.Max != 62 {
+		t.Errorf("mcp elapsed = %+v; want n=3 max=62 (call at 10s, result at 72s)", m.ElapsedSec)
+	}
+	if m.RunSec.N != 2 || m.RunSec.Max != 2 || m.RunSec.P50 != 1 {
+		t.Errorf("mcp run = %+v; want n=2 (the denied call left out) p50=1 max=2", m.RunSec)
+	}
+	w := rt.Approvals.Gate.OperatorWaitSec
+	if w.N != 2 || w.Max != 57 || w.P50 != 6 {
+		t.Errorf("operator wait = %+v; want n=2 p50=6 (74s→80s) max=57 (13s→70s)", w)
+	}
+	if r := rt.Tools.Builtin["read_file"]; r.RunSec != r.ElapsedSec || r.RunSec.Max != 2 {
+		t.Errorf("read_file run %+v elapsed %+v; want both max=2", r.RunSec, r.ElapsedSec)
+	}
+	if rt.Anomalies.UnmatchedDecisions != 0 {
+		t.Errorf("unmatched decisions = %d; want 0", rt.Anomalies.UnmatchedDecisions)
+	}
+}
+
+func TestCallsStoppedBeforeRunningHaveNoRunTime(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(1, "message", calls(call("write_file", nil), call("edit_file", nil), call("shell_exec", nil))).
+		add(2, "hook_denied", map[string]any{"name": "write_file", "reason": "r"}).
+		add(2.1, "message", result("write_file", "denied")).
+		add(3, "tool_skipped", map[string]any{"name": "edit_file"}).
+		add(3.1, "message", result("edit_file", "skipped")).
+		add(5, "message", result("shell_exec", "ok")).
+		add(6, "message", answer())
+
+	rt := run(Options{}, s.f)
+	for _, name := range []string{"write_file", "edit_file"} {
+		if st := rt.Tools.Builtin[name]; st.ElapsedSec.N != 1 || st.RunSec.N != 0 {
+			t.Errorf("%s: elapsed %+v run %+v; want elapsed n=1, run n=0", name, st.ElapsedSec, st.RunSec)
+		}
+	}
+	if st := rt.Tools.Builtin["shell_exec"]; st.RunSec.N != 1 || st.RunSec.Max != 1.9 {
+		t.Errorf("shell_exec run = %+v; want n=1 max=1.9", st.RunSec)
+	}
+	if rt.Approvals.HookDenied != 1 {
+		t.Errorf("hook denied = %d; want 1", rt.Approvals.HookDenied)
+	}
+	// write + edit did not run, shell ran 1.9s: the group sums only that.
+	if g := rt.Tools.MultiCallByKind[Other]; g != (CallGroup{Responses: 1, Calls: 3, SequentialSec: 1.9, IfParallelSec: 1.9}) {
+		t.Errorf("other group = %+v", g)
+	}
+}
+
+func TestCallGroupsByKind(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		// read_only: a read tool and a read-lane shell call, 2s + 5s
+		add(10, "message", calls(call("read_file", nil), call("shell_exec", map[string]any{"access": "read"}))).
+		add(12, "message", result("read_file", "a")).
+		add(17, "message", result("shell_exec", "b")).
+		// with_mcp_or_web: a read tool, an MCP call and a web search, 1s + 4s + 3s
+		add(20, "message", calls(call("list_files", nil), call("mcp__srv__get", nil), call("web_search", nil))).
+		add(21, "message", result("list_files", "a")).
+		add(25, "message", result("mcp__srv__get", "b")).
+		add(28, "message", result("web_search", "c")).
+		// other: a write-lane shell call makes the whole response other
+		add(30, "message", calls(call("read_file", nil), call("shell_exec", map[string]any{"access": "write"}))).
+		add(31, "message", result("read_file", "a")).
+		add(33, "message", result("shell_exec", "b")).
+		// a single call is not a group
+		add(40, "message", calls(call("read_file", nil))).
+		add(41, "message", result("read_file", "a")).
+		// an interrupted response: one result of two arrives, then the turn ends
+		add(50, "message", calls(call("read_file", nil), call("view_image", nil))).
+		add(51, "message", result("read_file", "a")).
+		add(60, "message", user("stop")).
+		add(61, "message", calls(call("datetime", nil))).
+		add(62, "message", result("datetime", "now")).
+		add(63, "message", answer())
+
+	rt := run(Options{}, s.f)
+	want := map[string]CallGroup{
+		"read_only":       {Responses: 1, Calls: 2, SequentialSec: 7, IfParallelSec: 5},
+		"with_mcp_or_web": {Responses: 1, Calls: 3, SequentialSec: 8, IfParallelSec: 4},
+		Other:             {Responses: 1, Calls: 2, SequentialSec: 3, IfParallelSec: 2},
+	}
+	if len(rt.Tools.MultiCallByKind) != len(want) {
+		t.Errorf("groups = %+v; want %+v", rt.Tools.MultiCallByKind, want)
+	}
+	for k, w := range want {
+		if got := rt.Tools.MultiCallByKind[k]; got != w {
+			t.Errorf("%s = %+v; want %+v", k, got, w)
+		}
+	}
+	if rt.Tools.MultiCallResponses != 4 {
+		t.Errorf("multi-call responses = %d; want 4 (the interrupted one counts here)", rt.Tools.MultiCallResponses)
+	}
+}
+
+func TestCallGroupOutsideThePeriodIsNotCounted(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(10, "message", calls(call("read_file", nil), call("list_files", nil))).
+		add(7200, "message", result("read_file", "a")).
+		add(7201, "message", result("list_files", "b"))
+	rt := run(Options{Since: t0.Add(time.Hour)}, s.f)
+	if len(rt.Tools.MultiCallByKind) != 0 {
+		t.Errorf("groups = %+v; want none (the response was before the period)", rt.Tools.MultiCallByKind)
+	}
+}
+
+func TestDecisionForAnotherCallIsAnAnomaly(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(1, "gate_decision", map[string]any{"name": "write_file", "decision": "approved", "source": "operator"}). // nothing pending
+		add(2, "message", calls(call("write_file", nil), call("edit_file", nil))).
+		add(3, "gate_decision", map[string]any{"name": "edit_file", "decision": "denied", "source": "operator"}). // not the first
+		add(5, "message", result("write_file", "ok")).
+		add(6, "message", result("edit_file", "ok"))
+	rt := run(Options{}, s.f)
+	if rt.Anomalies.UnmatchedDecisions != 2 {
+		t.Errorf("unmatched decisions = %d; want 2", rt.Anomalies.UnmatchedDecisions)
+	}
+	// An unmatched decision changes no call: both ran, timed from the previous result.
+	if w, e := rt.Tools.Builtin["write_file"].RunSec, rt.Tools.Builtin["edit_file"].RunSec; w.Max != 3 || e.Max != 1 {
+		t.Errorf("write run %+v edit run %+v; want 3 and 1", w, e)
+	}
+	if rt.Approvals.Gate.OperatorWaitSec.N != 0 {
+		t.Errorf("operator wait = %+v; want none (no decision matched a call)", rt.Approvals.Gate.OperatorWaitSec)
+	}
+}
+
+func TestLaneDefaultRead(t *testing.T) {
+	for _, c := range []struct {
+		runtime, version string
+		want             bool
+	}{
+		{"lagent", "v0.1.0", true},
+		{"lagent", "dev", true},
+		{"gem-agent", "v0.69.0", true},
+		{"gem-agent", "v0.94.0-6-gee60cc3-dirty", true},
+		{"gem-agent", "v1.0.0", true},
+		{"gem-agent", "v0.68.9", false},
+		{"gem-agent", "v0.9.0", false},
+		{"gem-agent", "dev", false},
+		{"gem-agent", "", false},
+	} {
+		if got := laneDefaultRead(c.runtime, c.version); got != c.want {
+			t.Errorf("laneDefaultRead(%q, %q) = %v; want %v", c.runtime, c.version, got, c.want)
+		}
+	}
+}
+
+func TestShellWithNoLaneIsAReadWhereLanesExist(t *testing.T) {
+	group := func(runtime, version string) map[string]CallGroup {
+		s := newSession(version, "m").
+			add(0, "message", user("go")).
+			add(1, "message", calls(call("read_file", nil), call("shell_exec", map[string]any{"command": "ls"}))).
+			add(2, "message", result("read_file", "a")).
+			add(3, "message", result("shell_exec", "b"))
+		a := New(runtime, Options{})
+		a.Add(s.f)
+		return a.Result().Tools.MultiCallByKind
+	}
+	for _, c := range []struct{ runtime, version, want string }{
+		{"lagent", "v0.17.0", groupReadOnly},
+		{"gem-agent", "v0.94.0", groupReadOnly},
+		{"gem-agent", "v0.60.0", Other}, // before lanes every shell call could write
+		{"gem-agent", "dev", Other},     // cannot be placed
+	} {
+		g := group(c.runtime, c.version)
+		if len(g) != 1 || g[c.want].Responses != 1 {
+			t.Errorf("%s %s: groups = %+v; want one %s", c.runtime, c.version, g, c.want)
+		}
+	}
+}
+
+func TestCeilingRefusalHasNoRunTime(t *testing.T) {
+	s := newSession("v0.94.0", "m").
+		add(0, "message", user("go")).
+		add(1, "message", calls(call("write_file", nil))).
+		add(40, "ceiling_refused", map[string]any{"name": "write_file"}).
+		add(40.1, "message", result("write_file", "refused"))
+	rt := run(Options{}, s.f)
+	if st := rt.Tools.Builtin["write_file"]; st.ElapsedSec.N != 1 || st.RunSec.N != 0 {
+		t.Errorf("elapsed %+v run %+v; want elapsed n=1, run n=0", st.ElapsedSec, st.RunSec)
+	}
+}

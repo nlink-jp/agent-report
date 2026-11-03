@@ -87,19 +87,41 @@ type TokenBucket struct {
 // call in the same model response (from the response itself for the first
 // call) to this call's result: the runtimes run a response's calls one
 // after another, so it is the call's own time, including any time spent
-// waiting for an approval or an answer.
+// waiting for an approval or an answer. Run starts instead at the call's
+// last approval decision, when it had one, so it leaves out the risk
+// review and the wait at the prompt; a call that did not run (denied at
+// the prompt or by a hook, or skipped) is not in it.
 type ToolStat struct {
 	Calls      int  `json:"calls"`
 	ElapsedSec Dist `json:"elapsed_sec"`
+	RunSec     Dist `json:"run_sec"`
 }
 
 // Tools summarises tool calls.
 type Tools struct {
-	ResponsesWithCalls int                 `json:"responses_with_calls"`
-	MultiCallResponses int                 `json:"multi_call_responses"`
-	Builtin            map[string]ToolStat `json:"builtin"`
-	UnknownNameCalls   int                 `json:"unknown_name_calls"`
-	MCP                MCP                 `json:"mcp"`
+	ResponsesWithCalls int                  `json:"responses_with_calls"`
+	MultiCallResponses int                  `json:"multi_call_responses"`
+	MultiCallByKind    map[string]CallGroup `json:"multi_call_by_kind"`
+	Builtin            map[string]ToolStat  `json:"builtin"`
+	UnknownNameCalls   int                  `json:"unknown_name_calls"`
+	MCP                MCP                  `json:"mcp"`
+}
+
+// CallGroup sums the responses with several calls of one kind: read_only
+// (built-in tools the runtimes mark as not changing anything, and
+// read-lane shell calls), with_mcp_or_web (those plus MCP, web_fetch or
+// web_search calls), or other. Sequential is the run seconds of every
+// call added up, as the runtimes ran them; if_parallel adds up only each
+// response's longest call — the time had the calls run at once, an
+// estimate that assumes they would not slow one another and could all
+// start together. The runtimes answer every call, an interrupted one at
+// once, so such a call counts with almost no time; only a response whose
+// results are missing (the process died) is not counted.
+type CallGroup struct {
+	Responses     int     `json:"responses"`
+	Calls         int     `json:"calls"`
+	SequentialSec float64 `json:"sequential_sec"`
+	IfParallelSec float64 `json:"if_parallel_sec"`
 }
 
 // MCP summarises calls to MCP servers. ByServer is filled only when the
@@ -109,6 +131,7 @@ type MCP struct {
 	Servers    int            `json:"servers"`
 	Tools      int            `json:"tools"`
 	ElapsedSec Dist           `json:"elapsed_sec"`
+	RunSec     Dist           `json:"run_sec"`
 	ByServer   map[string]int `json:"by_server,omitempty"`
 }
 
@@ -133,13 +156,18 @@ type AutoApprovals struct {
 	ModelConsulted int            `json:"model_consulted"`
 }
 
-// GateApprovals are decisions taken at the approval prompt.
+// GateApprovals are decisions taken at the approval prompt. The operator
+// wait runs from the call's start (or its auto-approve decision) to the
+// operator's answer. A one-shot run denies at the prompt without asking
+// and is recorded the same way, as a wait of almost nothing; how a run
+// was launched is not recorded, so those cannot be told apart.
 type GateApprovals struct {
-	Approved      int            `json:"approved"`
-	Denied        int            `json:"denied"`
-	OtherDecision int            `json:"other_decision"`
-	BySource      map[string]int `json:"by_source"`
-	MustPrompt    int            `json:"must_prompt"`
+	Approved        int            `json:"approved"`
+	Denied          int            `json:"denied"`
+	OtherDecision   int            `json:"other_decision"`
+	BySource        map[string]int `json:"by_source"`
+	MustPrompt      int            `json:"must_prompt"`
+	OperatorWaitSec Dist           `json:"operator_wait_sec"`
 }
 
 // Modes counts session modes. A session counts once even when it was
@@ -159,4 +187,8 @@ type Anomalies struct {
 	UnreadableLines       int `json:"unreadable_lines"`
 	UnknownRecordKinds    int `json:"unknown_record_kinds"`
 	UnmatchedToolResults  int `json:"unmatched_tool_results"`
+	// A decision record that names a call other than the one awaiting its
+	// result: the run and wait times above assume the order the runtimes
+	// write today.
+	UnmatchedDecisions int `json:"unmatched_decisions"`
 }

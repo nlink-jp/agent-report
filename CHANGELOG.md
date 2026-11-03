@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `run_sec` per built-in tool and for MCP calls: the time from the call's
+  last approval decision to its result, leaving out the risk review and the
+  wait at the prompt; calls that did not run are left out.
+- `approvals.gate.operator_wait_sec`: how long approval prompts waited for
+  the operator's answer.
+- `tools.multi_call_by_kind`: responses with several calls by kind
+  (`read_only`, `with_mcp_or_web`, `other`), with the seconds their calls
+  took one after another and would have taken at once.
+- `anomalies.unmatched_decisions`: decision records that do not name the
+  call awaiting its result.
+
+These fields are added to report schema 1; nothing was renamed or removed.
+
 ### Fixed
 
 - gem-agent's `connection_lost` and lagent's `window_full` records were

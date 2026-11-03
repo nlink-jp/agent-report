@@ -75,14 +75,14 @@ zone). Then, per runtime:
 | `turns` | operator turns and rounds per turn (n / p50 / p90 / max) |
 | `context` | largest prompt per session, cached share of prompt, compactions |
 | `tokens` | calls and tokens per call source (main loop, risk review, …) |
-| `tools` | responses with calls, responses with several calls, calls and elapsed seconds per built-in tool, calls to unknown names, MCP calls / servers / tools / elapsed seconds |
+| `tools` | responses with calls, responses with several calls (and, by kind, their calls and the seconds they took one after another and would have taken at once), calls and elapsed / run seconds per built-in tool, calls to unknown names, MCP calls / servers / tools / elapsed / run seconds |
 | `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded / other), timeouts |
-| `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, hook denials |
+| `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, seconds spent waiting for your answer at the prompt, hook denials |
 | `interventions` | round-limit and loop interventions |
 | `modes` | sessions that started with auto-approve or read-only (counted once per session, resumes included), mode changes |
 | `empty_model_responses` | model responses that came back empty |
 | `not_recorded` | facts the transcripts do not hold, each with the reason |
-| `anomalies` | unreadable directories, files and lines, missing headers, unsupported schema, unknown record kinds, unmatched tool results |
+| `anomalies` | unreadable directories, files and lines, missing headers, unsupported schema, unknown record kinds, unmatched tool results, approval decisions that name a call other than the one awaiting its result |
 
 Strings from a transcript appear only when they belong to a closed set: an
 enumerated value the runtimes write, a known built-in tool name, or a
@@ -101,6 +101,33 @@ The runtimes run the calls of one model response one after another. A call's
 elapsed seconds run from the end of the previous call in that response (from
 the response itself for the first call) to the call's result, so they include
 time spent waiting for an approval or for your answer to `ask_user`.
+
+Run seconds start instead at the call's last approval decision, when it had
+one, so they leave out the risk review and the wait at the prompt; a call
+that did not run (denied at the prompt or by a hook, or skipped) is left out
+of them. `ask_user` has no approval, so its run seconds are the wait for your
+answer. `operator_wait_sec` is the other side: from the call's start (or its
+auto-approve decision) to your answer at the prompt, whether you approved or
+denied.
+
+A one-shot run (`-p`) denies at the prompt without asking you, and the
+runtimes record that as your answer; since how a run was launched is not
+recorded, those denials sit in `operator_wait_sec` as waits of almost
+nothing.
+
+`multi_call_by_kind` sorts the responses with several calls into
+`read_only` (built-in tools both runtimes mark as changing nothing, and
+read-lane shell calls — including a shell call that names no lane, which
+runs in the read lane), `with_mcp_or_web` (those plus MCP, `web_fetch` or
+`web_search` calls) and `other`. For each kind, `sequential_sec` adds up the
+run seconds of every call and `if_parallel_sec` adds up only each response's
+longest call — what the calls would have taken had they run at once,
+assuming they would not slow one another and could all start together (a
+call that needs a tool loaded by an earlier call in the same response could
+not). The runtimes answer every call, an interrupted one at once, so it
+counts with almost no time; only a response whose results are missing
+(the runtime stopped mid-response) is left out, so these responses can add
+up to fewer than `multi_call_responses`.
 
 The table and `--json` are drawn from the same data; the table is the JSON
 laid out as indented lines.

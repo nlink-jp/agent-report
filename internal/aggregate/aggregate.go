@@ -13,6 +13,7 @@ import (
 	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,25 @@ var BuiltinTools = setOf(
 	"render_diagram", "request_directory", "save_memory", "search_files",
 	"shell_exec", "show_image", "summarize_file", "view_image", "web_fetch",
 	"web_search", "write_file",
+)
+
+// readOnlyTools are the built-ins both runtimes declare as changing
+// nothing (their Mutating flag is false); the runtimes' flag decides, not
+// this tool. ask_user is left out: it waits on the operator, so it could
+// not run alongside anything. MCP tools and web_fetch / web_search are
+// flagged mutating in the runtimes and form their own kind of call.
+var readOnlyTools = setOf(
+	"agent_info", "agentic_file_search", "datetime", "file_info",
+	"find_tools", "list_files", "list_tree", "load_skill", "mcp_load",
+	"read_document", "read_file", "render_diagram", "search_files",
+	"show_image", "summarize_file", "view_image",
+)
+
+// The kinds of a response with several calls (CallGroup).
+const (
+	groupReadOnly = "read_only"
+	groupMCPOrWeb = "with_mcp_or_web"
+	groupOther    = Other
 )
 
 // knownKinds are the record kinds the runtimes write. A kind outside it
@@ -66,6 +86,8 @@ var (
 	versionRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+(-\d+-g[0-9a-f]{7,40})?(-dirty)?$`)
 	// A build from an untagged commit reports only its hash.
 	untaggedRe = regexp.MustCompile(`^[0-9a-f]{7,40}(-dirty)?$`)
+	// The release numbers of a version that versionRe accepts.
+	releaseRe = regexp.MustCompile(`^v?(\d+)\.(\d+)\.(\d+)(-\d+-g[0-9a-f]{7,40})?(-dirty)?$`)
 	// A model id, optionally under one publisher prefix ("google/gemma-…").
 	// No "@" (an address), and at most one "/" (a resource path such as
 	// projects/<id>/locations/… or a file path has more).
@@ -111,6 +133,10 @@ type Aggregator struct {
 	maxPrompt  []float64
 	elapsed    map[string][]float64
 	mcpElapsed []float64
+	run        map[string][]float64
+	mcpRun     []float64
+	wait       []float64
+	groups     map[string]*groupSum
 	mcpServers map[string]bool
 	mcpTools   map[string]bool
 	promptMain int
@@ -135,6 +161,8 @@ func New(name string, opts Options) *Aggregator {
 			NotRecorded:   NotRecorded(),
 		},
 		elapsed:    map[string][]float64{},
+		run:        map[string][]float64{},
+		groups:     map[string]*groupSum{},
 		mcpServers: map[string]bool{},
 		mcpTools:   map[string]bool{},
 	}
@@ -182,7 +210,7 @@ func (a *Aggregator) Add(f transcript.File) {
 
 	// Records before the period are still walked, uncounted, so a call
 	// made before the cutoff pairs with its result after it.
-	s := sessionState{a: a}
+	s := sessionState{a: a, laneDefaultRead: laneDefaultRead(a.name, f.Header.Version)}
 	for _, r := range f.Records {
 		s.record(r, a.inPeriod(r.TS))
 	}
@@ -191,21 +219,42 @@ func (a *Aggregator) Add(f transcript.File) {
 
 // pendingCall is a tool call awaiting its result.
 type pendingCall struct {
-	name    string
-	counted bool
+	name      string
+	counted   bool
+	kind      string    // groupReadOnly, groupMCPOrWeb or groupOther
+	decidedAt time.Time // its last approval decision; zero when none
+	notRun    bool      // denied, or skipped before it ran
+}
+
+// groupSum accumulates a CallGroup before rounding.
+type groupSum struct {
+	responses, calls       int
+	sequential, ifParallel float64
+}
+
+// openGroup is a response with several calls whose results are arriving.
+type openGroup struct {
+	counted             bool
+	kind                string
+	calls               int
+	sequential, longest float64
 }
 
 // sessionState carries what spans records within one transcript.
 type sessionState struct {
-	a           *Aggregator
-	inTurn      bool
-	turnRounds  int
-	pending     []pendingCall // in call order
-	prevTS      time.Time
-	maxPrompt   int
-	sawUsage    bool
-	autoAtStart bool
-	roAtStart   bool
+	a          *Aggregator
+	inTurn     bool
+	turnRounds int
+	pending    []pendingCall // in call order
+	group      *openGroup    // nil unless the response had several calls
+	// laneDefaultRead: a shell call that declares no lane runs in the
+	// read lane (lagent always; gem-agent since lanes arrived).
+	laneDefaultRead bool
+	prevTS          time.Time
+	maxPrompt       int
+	sawUsage        bool
+	autoAtStart     bool
+	roAtStart       bool
 }
 
 // The message fields are decoded leniently: model-written arguments are
@@ -292,6 +341,7 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		rt.Sessions.Resumed++
 	case "auto_decision":
 		var d struct {
+			Name     string `json:"name"`
 			Approved bool   `json:"approved"`
 			Tier     string `json:"tier"`
 			Model    bool   `json:"model"`
@@ -299,6 +349,9 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		if json.Unmarshal(r.Data, &d) != nil {
 			unreadable()
 			return
+		}
+		if p := s.decided(d.Name); p != nil {
+			p.decidedAt = r.TS
 		}
 		if d.Approved {
 			rt.Approvals.Auto.Approved++
@@ -311,6 +364,7 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		}
 	case "gate_decision":
 		var d struct {
+			Name       string `json:"name"`
 			Decision   string `json:"decision"`
 			Source     string `json:"source"`
 			MustPrompt bool   `json:"must_prompt"`
@@ -318,6 +372,13 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		if json.Unmarshal(r.Data, &d) != nil {
 			unreadable()
 			return
+		}
+		if p := s.decided(d.Name); p != nil {
+			if d.Source == "operator" {
+				a.wait = append(a.wait, s.since(p, r.TS))
+			}
+			p.decidedAt = r.TS
+			p.notRun = d.Decision == "denied"
 		}
 		switch d.Decision {
 		case "approved":
@@ -331,8 +392,20 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		if d.MustPrompt {
 			rt.Approvals.Gate.MustPrompt++
 		}
-	case "hook_denied":
-		rt.Approvals.HookDenied++
+	case "hook_denied", "tool_skipped", "tool_excluded", "tool_not_advertised", "ceiling_refused":
+		if r.Kind == "hook_denied" {
+			rt.Approvals.HookDenied++
+		}
+		var d struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(r.Data, &d) != nil {
+			unreadable()
+			return
+		}
+		if p := s.decided(d.Name); p != nil {
+			p.notRun = true
+		}
 	case "round_intervention":
 		var d struct {
 			Trigger string `json:"trigger"`
@@ -362,6 +435,27 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 	}
 }
 
+// decided returns the call a decision record speaks for: the runtimes
+// decide on a call just before running it, so it is the first call still
+// awaiting its result. Any other name is counted as an anomaly.
+func (s *sessionState) decided(name string) *pendingCall {
+	if len(s.pending) == 0 || s.pending[0].name != name {
+		s.a.rt.Anomalies.UnmatchedDecisions++
+		return nil
+	}
+	return &s.pending[0]
+}
+
+// since is the seconds from where the call's current stretch began — its
+// last decision, or the previous result — to t.
+func (s *sessionState) since(p *pendingCall, t time.Time) float64 {
+	start := s.prevTS
+	if !p.decidedAt.IsZero() {
+		start = p.decidedAt
+	}
+	return max(t.Sub(start).Seconds(), 0)
+}
+
 func (s *sessionState) message(r transcript.Record, m message, counted bool) {
 	a := s.a
 	rt := &a.rt
@@ -387,13 +481,22 @@ func (s *sessionState) message(r transcript.Record, m message, counted bool) {
 				rt.Tools.MultiCallResponses++
 			}
 		}
+		// The runtimes answer every call, even an interrupted one; only
+		// a dead process leaves results missing, and that group is dropped.
 		s.pending = s.pending[:0]
+		s.group = nil
 		s.prevTS = r.TS
+		kind := groupReadOnly
 		for _, c := range m.ToolCalls {
-			s.pending = append(s.pending, pendingCall{name: c.Name, counted: counted})
+			k := callKind(c, s.laneDefaultRead)
+			kind = widerKind(kind, k)
+			s.pending = append(s.pending, pendingCall{name: c.Name, counted: counted, kind: k})
 			if counted {
 				a.countCall(c)
 			}
+		}
+		if len(m.ToolCalls) > 1 {
+			s.group = &openGroup{counted: counted, kind: kind}
 		}
 	case "tool":
 		if len(s.pending) == 0 {
@@ -408,11 +511,29 @@ func (s *sessionState) message(r transcript.Record, m message, counted bool) {
 		// call's time runs from the previous result (from the response
 		// itself for the first call).
 		sec := max(r.TS.Sub(s.prevTS).Seconds(), 0)
+		run := s.since(&call, r.TS)
+		if call.notRun {
+			run = 0
+		}
 		s.prevTS = r.TS
+		if g := s.group; g != nil {
+			g.calls++
+			g.sequential += run
+			g.longest = max(g.longest, run)
+			if len(s.pending) == 0 {
+				s.group = nil
+				if g.counted {
+					a.addGroup(g)
+				}
+			}
+		}
 		if !call.counted || !counted {
 			return
 		}
 		a.recordElapsed(call.name, sec)
+		if !call.notRun {
+			a.recordRun(call.name, run)
+		}
 		if call.name == "shell_exec" && timedOut(text(m.Content)) {
 			rt.Shell.Timeouts++
 		}
@@ -475,6 +596,76 @@ func (a *Aggregator) countCall(c toolCall) {
 	}
 }
 
+// callKind sorts one call for CallGroup.
+func callKind(c toolCall, laneDefaultRead bool) string {
+	if _, ok := mcpServer(c.Name); ok {
+		return groupMCPOrWeb
+	}
+	switch {
+	case readOnlyTools[c.Name]:
+		return groupReadOnly
+	case c.Name == "shell_exec":
+		// The read lane is the runtimes' own "changes nothing" for a
+		// shell call (gem-agent ADR-0073).
+		lane := shellLane(c.Args)
+		if lane == "read" || (lane == Unrecorded && laneDefaultRead) {
+			return groupReadOnly
+		}
+		return groupOther
+	case c.Name == "web_fetch" || c.Name == "web_search":
+		return groupMCPOrWeb
+	default:
+		return groupOther
+	}
+}
+
+// laneEra is the first gem-agent release with shell lanes (ADR-0073).
+var laneEra = [3]int{0, 69, 0}
+
+// laneDefaultRead reports whether a shell call with no lane ran in the
+// read lane. lagent had lanes from its first release; gem-agent before
+// v0.69.0 had none, and a version that is not a release tag cannot be
+// placed, so its undeclared calls are not taken to be reads.
+func laneDefaultRead(runtime, v string) bool {
+	if runtime == "lagent" {
+		return true
+	}
+	m := releaseRe.FindStringSubmatch(v)
+	if m == nil {
+		return false
+	}
+	for i := range 3 {
+		n, _ := strconv.Atoi(m[i+1])
+		if n != laneEra[i] {
+			return n > laneEra[i]
+		}
+	}
+	return true
+}
+
+// widerKind is the kind of a response holding calls of kinds a and b.
+func widerKind(a, b string) string {
+	if a == groupOther || b == groupOther {
+		return groupOther
+	}
+	if a == groupMCPOrWeb || b == groupMCPOrWeb {
+		return groupMCPOrWeb
+	}
+	return groupReadOnly
+}
+
+func (a *Aggregator) addGroup(g *openGroup) {
+	sum := a.groups[g.kind]
+	if sum == nil {
+		sum = &groupSum{}
+		a.groups[g.kind] = sum
+	}
+	sum.responses++
+	sum.calls += g.calls
+	sum.sequential += g.sequential
+	sum.ifParallel += g.longest
+}
+
 // shellLane reads the lane a shell call declared. A missing lane is
 // unrecorded (older runtimes); a value that is not a known lane — or not
 // a string at all — is other.
@@ -511,6 +702,16 @@ func (a *Aggregator) recordElapsed(name string, sec float64) {
 	}
 }
 
+func (a *Aggregator) recordRun(name string, sec float64) {
+	if _, ok := mcpServer(name); ok {
+		a.mcpRun = append(a.mcpRun, sec)
+		return
+	}
+	if BuiltinTools[name] {
+		a.run[name] = append(a.run[name], sec)
+	}
+}
+
 // Result finishes the runtime's summary.
 func (a *Aggregator) Result() Runtime {
 	rt := a.rt
@@ -522,12 +723,24 @@ func (a *Aggregator) Result() Runtime {
 	builtin := make(map[string]ToolStat, len(rt.Tools.Builtin))
 	for name, st := range rt.Tools.Builtin {
 		st.ElapsedSec = dist(a.elapsed[name])
+		st.RunSec = dist(a.run[name])
 		builtin[name] = st
 	}
 	rt.Tools.Builtin = builtin
 	rt.Tools.MCP.Servers = len(a.mcpServers)
 	rt.Tools.MCP.Tools = len(a.mcpTools)
 	rt.Tools.MCP.ElapsedSec = dist(a.mcpElapsed)
+	rt.Tools.MCP.RunSec = dist(a.mcpRun)
+	rt.Approvals.Gate.OperatorWaitSec = dist(a.wait)
+	rt.Tools.MultiCallByKind = make(map[string]CallGroup, len(a.groups))
+	for kind, g := range a.groups {
+		rt.Tools.MultiCallByKind[kind] = CallGroup{
+			Responses:     g.responses,
+			Calls:         g.calls,
+			SequentialSec: round(g.sequential, 1),
+			IfParallelSec: round(g.ifParallel, 1),
+		}
+	}
 	return rt
 }
 

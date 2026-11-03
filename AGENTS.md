@@ -76,6 +76,29 @@ does, and gem-usage-lens is its other consumer.
   write results in call order, so results are matched to calls in order and
   a call's time runs from the previous result (from the response for the
   first call). It includes approval waits; `ask_user` can show hours.
+- **Run seconds and operator waits** rely on the order the runtimes write
+  today: `auto_decision` and `gate_decision` (and `hook_denied`,
+  `tool_skipped`, `tool_excluded`, `tool_not_advertised`) come after the
+  response and before the result, and name the first call still awaiting its
+  result. Run starts at the call's last decision; a denied or stopped call has
+  none. A decision naming any other call is counted as
+  `anomalies.unmatched_decisions` and changes nothing — if that count rises,
+  the order changed and the run times are no longer trustworthy.
+  `ceiling_refused` also marks a call as not run. Refusals that leave no
+  record — gem-agent's loop-guard skip, an interruption before execution,
+  invalid arguments, a call to an unknown name — enter `run_sec` at almost
+  zero; that residue is accepted. One-shot runs deny at the gate without
+  asking and record `source: operator`, so `operator_wait_sec` holds
+  near-zero samples from them (launch mode is not recorded).
+- **Undeclared shell lanes**: both runtimes' `ParseLane` reads a missing or
+  empty `access` as the read lane — lagent always, gem-agent since v0.69.0
+  (ADR-0073). `laneDefaultRead` uses the header version; a version that is
+  not a release tag cannot be placed and is not taken as read.
+- **Call kinds** (`multi_call_by_kind`): `readOnlyTools` mirrors the
+  built-ins whose `Mutating` flag is false in both runtimes, minus
+  `ask_user` (it waits on the operator). MCP tools, `web_fetch` and
+  `web_search` are Mutating in the runtimes (egress) and get their own kind.
+  When a runtime adds a built-in, decide its kind from that flag.
 - **The period**: records before `--since` are still walked, uncounted, so a
   call before the cutoff pairs with its result after it. Report times are UTC.
 - **Records written before gem-agent ADR-0057** carry no `source`; they are
