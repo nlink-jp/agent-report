@@ -36,6 +36,9 @@ type Runtime struct {
 	Turns               Turns                  `json:"turns"`
 	Context             Context                `json:"context"`
 	Tokens              map[string]TokenBucket `json:"tokens"` // per call source
+	TokensByModel       map[string]TokenBucket `json:"tokens_by_model"`
+	MainCalls           MainCalls              `json:"main_calls"`
+	Retries             Retries                `json:"retries"`
 	Tools               Tools                  `json:"tools"`
 	Shell               Shell                  `json:"shell"`
 	Approvals           Approvals              `json:"approvals"`
@@ -81,6 +84,63 @@ type TokenBucket struct {
 	Output   int `json:"output"`
 	Thoughts int `json:"thoughts"`
 	Cached   int `json:"cached"`
+}
+
+// MainCalls takes the main loop's model calls one at a time: how long each
+// kept the operator waiting and how much of what it sent was served from
+// the provider's cache. A call's wait runs from the record that ended the
+// work before it — the message it answers, a compaction, or another model
+// call's usage record — to its own usage record, so it is the model's
+// time and holds any retry inside it. RetrySecTotal is the part of
+// WaitSecTotal spent before the attempt that answered began: the refused
+// attempts and the backoff after each, read from the runtime's retry
+// records (see Retries for which sessions have them).
+//
+// The three tables sort the same calls three ways. A call is a hit when
+// at least half of its prompt was cached. ByPromptSize takes every call.
+// AfterReset takes the calls whose prompt could not have been sent
+// before — the session's first, the first after a compaction, a resume
+// or a clear, and the first after the tool declarations or the system
+// prompt changed — where a miss is expected. ByGap takes all the others,
+// by the seconds since the main call before them ended: there the prompt
+// repeats what that call sent, so a miss is the cache having let go.
+type MainCalls struct {
+	Calls          int        `json:"calls"`
+	WaitSec        Dist       `json:"wait_sec"`
+	WaitSecTotal   float64    `json:"wait_sec_total"`
+	CallsWithRetry int        `json:"calls_with_retry"`
+	RetrySecTotal  float64    `json:"retry_sec_total"`
+	ByPromptSize   []CallCell `json:"by_prompt_size"`
+	AfterReset     []CallCell `json:"after_reset"`
+	ByGap          []CallCell `json:"by_gap"`
+}
+
+// CallCell is one row of a MainCalls table. Bucket is one of a fixed
+// list, and every bucket is printed, an empty one with zeros. Prompt and
+// Cached are token sums; the waits are split by hit and miss because a
+// miss on a large prompt is the slow case.
+type CallCell struct {
+	Bucket      string `json:"bucket"`
+	Calls       int    `json:"calls"`
+	Prompt      int    `json:"prompt"`
+	Cached      int    `json:"cached"`
+	HitCalls    int    `json:"hit_calls"`
+	WaitSecHit  Dist   `json:"wait_sec_hit"`
+	WaitSecMiss Dist   `json:"wait_sec_miss"`
+}
+
+// Retries counts the backoff retries of model calls, whichever model was
+// asked. Only a runtime build that writes a retry record can show any:
+// SessionsRecording is how many of the counted sessions came from such a
+// build, and a zero Count beside a zero SessionsRecording means "not
+// recorded", not "none". BackoffSecTotal adds up the waits between
+// attempts; it leaves out the time the refused attempts themselves took.
+type Retries struct {
+	SessionsRecording int            `json:"sessions_recording"`
+	Count             int            `json:"count"`
+	ByCause           map[string]int `json:"by_cause"`
+	ByModel           map[string]int `json:"by_model"`
+	BackoffSecTotal   float64        `json:"backoff_sec_total"`
 }
 
 // ToolStat is one tool's calls. Elapsed runs from the end of the previous

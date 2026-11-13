@@ -99,6 +99,20 @@ does, and gem-usage-lens is its other consumer.
   `ask_user` (it waits on the operator). MCP tools, `web_fetch` and
   `web_search` are Mutating in the runtimes (egress) and get their own kind.
   When a runtime adds a built-in, decide its kind from that flag.
+- **Main calls** (`main_calls`, `internal/aggregate/maincalls.go`): a call's
+  wait starts at the last `message`, `compaction` or non-main `usage`
+  record and ends at its own `usage` record — both runtimes write the usage
+  record just before the assistant message. Records that can land while a
+  call is in flight (`notice`, `mode_change`, `model_retry`) do not move the
+  start. A hit is half the prompt cached or more. `track` runs for every
+  record, counted or not, so a call just inside the period is still compared
+  with the one before it. The bucket lists are fixed and every row is
+  printed; adding or renaming a bucket changes what two reports can compare.
+- **Retries**: gem-agent writes `model_retry` from v0.102.0 (its ADR-0116)
+  — `retryEra`; lagent writes none. Only `cause` (a closed set) and `model`
+  (through `modelRe`) are read out; the record's `error` is free text and
+  must stay unread. A retry is charged to a main call only when it names
+  that call's model and came after the last record that ended other work.
 - **The period**: records before `--since` are still walked, uncounted, so a
   call before the cutoff pairs with its result after it. Report times are UTC.
 - **Records written before gem-agent ADR-0057** carry no `source`; they are

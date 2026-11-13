@@ -69,7 +69,7 @@ var knownKinds = setOf(
 	"mcp_fault", "skills_reload", "persistent_changes", "added_directories",
 	"tool_late_return", "tool_excluded", "tool_not_advertised",
 	"tool_skipped", "assistant_empty", "riskbook_update",
-	"connection_lost", "window_full", "library_log",
+	"connection_lost", "window_full", "library_log", "model_retry",
 )
 
 var (
@@ -110,11 +110,17 @@ var runtimeNotePrefixes = []string{
 
 // NotRecorded explains, inside the report itself, what the transcripts do
 // not hold, so a reader does not take an absent item for zero.
-func NotRecorded() map[string]string {
-	return map[string]string{
+func NotRecorded(runtime string) map[string]string {
+	m := map[string]string{
 		"launch_mode": "how each run was started (-p, --auto, --allow) is not written to the transcripts",
 		"clear_count": "a /clear usually starts a new transcript without marking the old one, so it cannot be counted",
 	}
+	if runtime == "lagent" {
+		m["retries"] = "lagent does not write a record when a model call is retried"
+	} else {
+		m["retries_in_older_sessions"] = "gem-agent before v0.102.0 wrote no record of a retry; retries.sessions_recording counts the sessions that could hold one"
+	}
+	return m
 }
 
 // Options steer what is counted.
@@ -141,6 +147,7 @@ type Aggregator struct {
 	mcpTools   map[string]bool
 	promptMain int
 	cachedMain int
+	calls      callSums
 }
 
 // New starts an aggregator for the named runtime.
@@ -154,17 +161,20 @@ func New(name string, opts Options) *Aggregator {
 			Versions:      map[string]int{},
 			Models:        map[string]int{},
 			Tokens:        map[string]TokenBucket{},
+			TokensByModel: map[string]TokenBucket{},
+			Retries:       Retries{ByCause: map[string]int{}, ByModel: map[string]int{}},
 			Tools:         Tools{Builtin: map[string]ToolStat{}},
 			Shell:         Shell{ByLane: map[string]int{}},
 			Approvals:     Approvals{Auto: AutoApprovals{ByTier: map[string]int{}}, Gate: GateApprovals{BySource: map[string]int{}}},
 			Interventions: map[string]int{},
-			NotRecorded:   NotRecorded(),
+			NotRecorded:   NotRecorded(name),
 		},
 		elapsed:    map[string][]float64{},
 		run:        map[string][]float64{},
 		groups:     map[string]*groupSum{},
 		mcpServers: map[string]bool{},
 		mcpTools:   map[string]bool{},
+		calls:      newCallSums(),
 	}
 }
 
@@ -207,10 +217,14 @@ func (a *Aggregator) Add(f transcript.File) {
 	a.rt.Sessions.Count++
 	a.rt.Versions[version(f.Header.Version)]++
 	a.rt.Models[closed(f.Header.Model, modelRe)]++
+	if recordsRetries(a.name, f.Header.Version) {
+		a.rt.Retries.SessionsRecording++
+	}
 
 	// Records before the period are still walked, uncounted, so a call
 	// made before the cutoff pairs with its result after it.
 	s := sessionState{a: a, laneDefaultRead: laneDefaultRead(a.name, f.Header.Version)}
+	s.reset = resetStart
 	for _, r := range f.Records {
 		s.record(r, a.inPeriod(r.TS))
 	}
@@ -255,6 +269,7 @@ type sessionState struct {
 	sawUsage        bool
 	autoAtStart     bool
 	roAtStart       bool
+	mainCallState
 }
 
 // The message fields are decoded leniently: model-written arguments are
@@ -282,6 +297,9 @@ func text(raw json.RawMessage) string {
 func (s *sessionState) record(r transcript.Record, counted bool) {
 	a := s.a
 	rt := &a.rt
+	// Walked for every record, counted or not: a main call just inside
+	// the period is timed from, and compared with, what came before it.
+	s.track(r, counted)
 	if !counted {
 		if r.Kind == "message" {
 			var m message
@@ -307,6 +325,7 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 	case "usage":
 		var u struct {
 			Source   *string `json:"source"`
+			Model    string  `json:"model"`
 			Prompt   int     `json:"prompt"`
 			Output   int     `json:"output"`
 			Thoughts int     `json:"thoughts"`
@@ -327,6 +346,14 @@ func (s *sessionState) record(r transcript.Record, counted bool) {
 		b.Thoughts += u.Thoughts
 		b.Cached += u.Cached
 		rt.Tokens[src] = b
+		mk := closed(u.Model, modelRe)
+		mb := rt.TokensByModel[mk]
+		mb.Calls++
+		mb.Prompt += u.Prompt
+		mb.Output += u.Output
+		mb.Thoughts += u.Thoughts
+		mb.Cached += u.Cached
+		rt.TokensByModel[mk] = mb
 		// Records written before the source field existed came from the
 		// main loop only; they count toward context size too.
 		if src == "main" || src == Unrecorded {
@@ -630,14 +657,21 @@ func laneDefaultRead(runtime, v string) bool {
 	if runtime == "lagent" {
 		return true
 	}
+	return releaseAtLeast(v, laneEra)
+}
+
+// releaseAtLeast reports whether v is a release (or a build after one)
+// numbered era or later. A version that is not a release tag cannot be
+// placed and is not.
+func releaseAtLeast(v string, era [3]int) bool {
 	m := releaseRe.FindStringSubmatch(v)
 	if m == nil {
 		return false
 	}
 	for i := range 3 {
 		n, _ := strconv.Atoi(m[i+1])
-		if n != laneEra[i] {
-			return n > laneEra[i]
+		if n != era[i] {
+			return n > era[i]
 		}
 	}
 	return true
@@ -737,6 +771,8 @@ func (a *Aggregator) Result() Runtime {
 	rt.Tools.MCP.ElapsedSec = dist(a.mcpElapsed)
 	rt.Tools.MCP.RunSec = dist(a.mcpRun)
 	rt.Approvals.Gate.OperatorWaitSec = dist(a.wait)
+	rt.MainCalls = a.calls.result()
+	rt.Retries.BackoffSecTotal = round(a.calls.backoffSec, 1)
 	rt.Tools.MultiCallByKind = make(map[string]CallGroup, len(a.groups))
 	for kind, g := range a.groups {
 		rt.Tools.MultiCallByKind[kind] = CallGroup{

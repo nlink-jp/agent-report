@@ -125,7 +125,10 @@ func plantTranscripts(t *testing.T) string {
 		`{"ts":"2026-10-29T10:00:07Z","kind":"gate_decision","data":{"decision":"denied","detail":"` + marker + `","deny_reason":"` + marker + `","source":"` + marker + `","name":"x"}}`,
 		`{"ts":"2026-10-29T10:00:08Z","kind":"round_intervention","data":{"trigger":"` + marker + `","detail":"` + marker + `","reason":"` + marker + `"}}`,
 		`{"ts":"2026-10-29T10:00:09Z","kind":"notice","data":{"message":"` + marker + `"}}`,
-		`{"ts":"2026-10-29T10:00:10Z","kind":"usage","data":{"source":"` + marker + `","model":"` + marker + `","prompt":10}}`,
+		// A model id is shown as written when it has a model id's shape (the
+		// accepted residue, AGENTS.md); these two do not.
+		`{"ts":"2026-10-29T10:00:10Z","kind":"usage","data":{"source":"` + marker + `","model":"projects/` + marker + `/locations/global/endpoints/9","prompt":10}}`,
+		`{"ts":"2026-10-29T10:00:10.5Z","kind":"model_retry","data":{"model":"` + marker + `@example.com","attempt":2,"max":5,"cause":"` + marker + `","error":"` + marker + ` quota for project ` + marker + `","delay_ms":500}}`,
 		`{"ts":"2026-10-29T10:00:11Z","kind":"` + marker + `","data":{"x":"` + marker + `"}}`,
 		marker + ` not json`,
 	}
