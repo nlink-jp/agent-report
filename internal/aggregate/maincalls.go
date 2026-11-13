@@ -8,10 +8,11 @@ import (
 )
 
 // The main loop's model calls, one at a time (MainCalls), and the retry
-// records (Retries). Both are read from what the runtimes already write:
-// a usage record after each call, the records that end the work before
-// it, and — from the builds that have it — a model_retry record for each
-// backoff.
+// records (Retries). Both are read from what the runtimes write: a usage
+// record after each call, the records that end the work before it, and —
+// from the builds that have it — a model_retry record for each backoff.
+// A retry belongs to the main call in flight when its source is "main";
+// nothing else of the record is used to place it.
 
 // sizeBuckets and gapBuckets are the fixed rows of the MainCalls tables,
 // in print order; the last row of each takes everything above.
@@ -50,8 +51,9 @@ const (
 
 var resetOrder = []string{resetStart, resetCompaction, resetResume, resetClear, resetDeclared}
 
-// retryCauses are the values the runtime writes as a retry's cause.
-var retryCauses = setOf("429", "500", "502", "503", "504", "error")
+// retryCauses are the values the runtime writes as a retry's cause: the
+// transient statuses it retries on.
+var retryCauses = setOf("429", "500", "502", "503", "504")
 
 // retryEra is the first gem-agent release that records a retry
 // (gem-agent ADR-0116).
@@ -106,15 +108,18 @@ func (c *cellSum) add(prompt, cached int, hit, timed bool, wait float64) {
 
 // callSums accumulates MainCalls and the retry backoff for one runtime.
 type callSums struct {
-	calls, withRetry      int
-	wait                  []float64
-	waitTotal, retryTotal float64
-	backoffSec            float64
-	bySize, reset, byGap  map[string]*cellSum
+	calls, withRetry             int
+	wait                         []float64
+	waitTotal, retryTotal        float64
+	backoffSec                   float64
+	bySize, reset, byIdle, byAge map[string]*cellSum
 }
 
 func newCallSums() callSums {
-	return callSums{bySize: map[string]*cellSum{}, reset: map[string]*cellSum{}, byGap: map[string]*cellSum{}}
+	return callSums{
+		bySize: map[string]*cellSum{}, reset: map[string]*cellSum{},
+		byIdle: map[string]*cellSum{}, byAge: map[string]*cellSum{},
+	}
 }
 
 func cell(m map[string]*cellSum, key string) *cellSum {
@@ -147,41 +152,51 @@ func (c *callSums) result() MainCalls {
 	for _, b := range sizeBuckets {
 		sizes = append(sizes, b.name)
 	}
+	sizes = append(sizes, sizeTop)
 	gaps := make([]string, 0, len(gapBuckets)+1)
 	for _, b := range gapBuckets {
 		gaps = append(gaps, b.name)
 	}
+	gaps = append(gaps, gapTop)
 	return MainCalls{
 		Calls:          c.calls,
 		WaitSec:        dist(c.wait),
 		WaitSecTotal:   round(c.waitTotal, 1),
 		CallsWithRetry: c.withRetry,
 		RetrySecTotal:  round(c.retryTotal, 1),
-		ByPromptSize:   table(c.bySize, append(sizes, sizeTop)),
+		ByPromptSize:   table(c.bySize, sizes),
 		AfterReset:     table(c.reset, resetOrder),
-		ByGap:          table(c.byGap, append(gaps, gapTop)),
+		ByIdle:         table(c.byIdle, gaps),
+		ByPrefixAge:    table(c.byAge, gaps),
 	}
-}
-
-// pendingRetry is a retry seen since the last record that ended other
-// work: the attempt after it began at resumed.
-type pendingRetry struct {
-	model   string
-	resumed time.Time
 }
 
 // mainCallState is what one transcript carries from record to record for
 // the per-call tables.
 type mainCallState struct {
 	// callStart is when the work before the next model call ended: the
-	// last message, compaction, or usage record.
+	// last message, compaction, round-limit decision or usage record.
 	callStart time.Time
-	// prevMainEnd is the usage record of the main call before.
-	prevMainEnd time.Time
+	// prevMainStart and prevMainEnd bound the main call before; the
+	// start is zero when that call's own start was not known.
+	prevMainStart, prevMainEnd time.Time
 	// reset names why the next main call's prompt is new; "" when it
 	// repeats what the call before sent.
-	reset   string
-	retries []pendingRetry
+	reset string
+	// retried holds, for each retry of the main call now in flight, when
+	// the attempt after it began.
+	retried []time.Time
+	// recording: this session was started or resumed by a build that
+	// writes a retry record.
+	recording bool
+}
+
+// moveStart marks t as the end of the work before the next model call.
+// Whatever was in flight before it is over, so its retries are too: a
+// main call that gave up after its last attempt wrote no usage record,
+// and the next call must not inherit its retries.
+func (s *sessionState) moveStart(t time.Time) {
+	s.callStart, s.retried = t, s.retried[:0]
 }
 
 // track follows every record, in or out of the period, and counts the
@@ -189,24 +204,43 @@ type mainCallState struct {
 func (s *sessionState) track(r transcript.Record, counted bool) {
 	switch r.Kind {
 	case "message":
-		s.callStart, s.retries = r.TS, s.retries[:0]
+		s.moveStart(r.TS)
 	case "compaction":
 		s.reset = resetCompaction
-		s.callStart, s.retries = r.TS, s.retries[:0]
+		s.moveStart(r.TS)
+	case "round_intervention":
+		// Written after the review and after the operator answered the
+		// round-limit dialog: the model call starts here, not at the
+		// message, or the dialog's wait would count as the model's.
+		s.moveStart(r.TS)
 	case "resumed":
 		s.reset = resetResume
+		var d struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal(r.Data, &d) == nil && recordsRetries(s.a.name, d.Version) {
+			s.recording = true
+		}
 	case "clear":
 		s.reset = resetClear
 	case "mcp_advertise", "mcp_reload", "skills_reload":
-		// A stronger reason already waiting says more than this one.
-		if s.reset == "" {
-			s.reset = resetDeclared
+		s.declared()
+	case "added_directories":
+		// The record is also written at start and after /clear, where it
+		// changes nothing; a directory granted mid-session rebuilds the
+		// system prompt, and only that one carries "granted".
+		var d map[string]json.RawMessage
+		if json.Unmarshal(r.Data, &d) == nil {
+			if _, ok := d["granted"]; ok {
+				s.declared()
+			}
 		}
 	case "model_retry":
 		var d struct {
-			Model   string `json:"model"`
-			Cause   string `json:"cause"`
-			DelayMS int    `json:"delay_ms"`
+			Model   string  `json:"model"`
+			Source  *string `json:"source"`
+			Cause   string  `json:"cause"`
+			DelayMS int     `json:"delay_ms"`
 		}
 		if json.Unmarshal(r.Data, &d) != nil {
 			if counted {
@@ -214,19 +248,28 @@ func (s *sessionState) track(r transcript.Record, counted bool) {
 			}
 			return
 		}
+		// A session that holds a retry record could record one, whatever
+		// its version says: a build between two tags cannot be placed.
+		s.recording = true
 		delay := time.Duration(max(d.DelayMS, 0)) * time.Millisecond
-		s.retries = append(s.retries, pendingRetry{model: d.Model, resumed: r.TS.Add(delay)})
+		src := Unrecorded
+		if d.Source != nil {
+			src = closedSet(*d.Source, tokenSources)
+		}
+		if src == "main" {
+			s.retried = append(s.retried, r.TS.Add(delay))
+		}
 		if counted {
 			rt := &s.a.rt
 			rt.Retries.Count++
 			rt.Retries.ByCause[closedSet(d.Cause, retryCauses)]++
+			rt.Retries.BySource[src]++
 			rt.Retries.ByModel[closed(d.Model, modelRe)]++
 			s.a.calls.backoffSec += delay.Seconds()
 		}
 	case "usage":
 		var u struct {
 			Source *string `json:"source"`
-			Model  string  `json:"model"`
 			Prompt int     `json:"prompt"`
 			Cached int     `json:"cached"`
 		}
@@ -235,20 +278,27 @@ func (s *sessionState) track(r transcript.Record, counted bool) {
 		}
 		// A record from before the source field came from the main loop.
 		if u.Source != nil && *u.Source != "main" {
-			// Another model call ended here; its retries were its own.
-			s.callStart, s.retries = r.TS, s.retries[:0]
+			s.moveStart(r.TS) // another model call ended here
 			return
 		}
 		if counted {
-			s.mainCall(r.TS, u.Model, u.Prompt, u.Cached)
+			s.mainCall(r.TS, u.Prompt, u.Cached)
 		}
-		s.prevMainEnd, s.reset = r.TS, ""
-		s.callStart, s.retries = r.TS, s.retries[:0]
+		s.prevMainStart, s.prevMainEnd, s.reset = s.callStart, r.TS, ""
+		s.moveStart(r.TS)
+	}
+}
+
+// declared notes that the tool declarations or the system prompt
+// changed. A stronger reason already waiting says more than this one.
+func (s *sessionState) declared() {
+	if s.reset == "" {
+		s.reset = resetDeclared
 	}
 }
 
 // mainCall counts one main-loop call whose usage record was written at ts.
-func (s *sessionState) mainCall(ts time.Time, model string, prompt, cached int) {
+func (s *sessionState) mainCall(ts time.Time, prompt, cached int) {
 	c := &s.a.calls
 	c.calls++
 	timed := !s.callStart.IsZero()
@@ -258,12 +308,12 @@ func (s *sessionState) mainCall(ts time.Time, model string, prompt, cached int) 
 		c.wait = append(c.wait, wait)
 		c.waitTotal += wait
 	}
-	// A retry of this call names the model the call was made to. The
-	// attempt that answered began when the last of them resumed.
+	// The attempt that answered began when the last retry's backoff ran
+	// out; everything before that was refused attempts and waiting.
 	var resumed time.Time
-	for _, p := range s.retries {
-		if p.model == model && p.resumed.After(resumed) {
-			resumed = p.resumed
+	for _, t := range s.retried {
+		if t.After(resumed) {
+			resumed = t
 		}
 	}
 	if !resumed.IsZero() {
@@ -278,7 +328,12 @@ func (s *sessionState) mainCall(ts time.Time, model string, prompt, cached int) 
 	switch {
 	case s.reset != "":
 		cell(c.reset, s.reset).add(prompt, cached, hit, timed, wait)
-	case !s.prevMainEnd.IsZero():
-		cell(c.byGap, gapBucket(ts.Sub(s.prevMainEnd).Seconds())).add(prompt, cached, hit, timed, wait)
+	case timed && !s.prevMainEnd.IsZero():
+		idle := max(s.callStart.Sub(s.prevMainEnd).Seconds(), 0)
+		cell(c.byIdle, gapBucket(idle)).add(prompt, cached, hit, timed, wait)
+		if !s.prevMainStart.IsZero() {
+			age := max(s.callStart.Sub(s.prevMainStart).Seconds(), 0)
+			cell(c.byAge, gapBucket(age)).add(prompt, cached, hit, timed, wait)
+		}
 	}
 }

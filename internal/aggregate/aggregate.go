@@ -117,6 +117,7 @@ func NotRecorded(runtime string) map[string]string {
 	}
 	if runtime == "lagent" {
 		m["retries"] = "lagent does not write a record when a model call is retried"
+		m["cache_misses"] = "lagent writes a cached count of 0 both when nothing was cached and when the server reported no count, so a miss in main_calls may be a call whose cache use is unknown"
 	} else {
 		m["retries_in_older_sessions"] = "gem-agent before v0.102.0 wrote no record of a retry; retries.sessions_recording counts the sessions that could hold one"
 	}
@@ -162,7 +163,7 @@ func New(name string, opts Options) *Aggregator {
 			Models:        map[string]int{},
 			Tokens:        map[string]TokenBucket{},
 			TokensByModel: map[string]TokenBucket{},
-			Retries:       Retries{ByCause: map[string]int{}, ByModel: map[string]int{}},
+			Retries:       Retries{ByCause: map[string]int{}, BySource: map[string]int{}, ByModel: map[string]int{}},
 			Tools:         Tools{Builtin: map[string]ToolStat{}},
 			Shell:         Shell{ByLane: map[string]int{}},
 			Approvals:     Approvals{Auto: AutoApprovals{ByTier: map[string]int{}}, Gate: GateApprovals{BySource: map[string]int{}}},
@@ -217,14 +218,12 @@ func (a *Aggregator) Add(f transcript.File) {
 	a.rt.Sessions.Count++
 	a.rt.Versions[version(f.Header.Version)]++
 	a.rt.Models[closed(f.Header.Model, modelRe)]++
-	if recordsRetries(a.name, f.Header.Version) {
-		a.rt.Retries.SessionsRecording++
-	}
 
 	// Records before the period are still walked, uncounted, so a call
 	// made before the cutoff pairs with its result after it.
 	s := sessionState{a: a, laneDefaultRead: laneDefaultRead(a.name, f.Header.Version)}
 	s.reset = resetStart
+	s.recording = recordsRetries(a.name, f.Header.Version)
 	for _, r := range f.Records {
 		s.record(r, a.inPeriod(r.TS))
 	}
@@ -594,6 +593,9 @@ func (s *sessionState) finish() {
 	}
 	if s.roAtStart {
 		s.a.rt.Modes.SessionsReadOnlyAtStart++
+	}
+	if s.recording {
+		s.a.rt.Retries.SessionsRecording++
 	}
 }
 

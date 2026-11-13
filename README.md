@@ -76,8 +76,8 @@ zone). Then, per runtime:
 | `context` | largest prompt per session, cached share of prompt, compactions |
 | `tokens` | calls and tokens per call source (main loop, risk review, …) |
 | `tokens_by_model` | the same calls and tokens per model the runtime asked |
-| `main_calls` | the main loop's model calls one at a time: seconds each kept you waiting, seconds lost to retries, and — by prompt size, by what reset the prompt, and by the gap since the call before — calls, prompt and cached tokens, cache hits, and the wait of a hit and of a miss |
-| `retries` | backoff retries of model calls by cause and by model, the seconds of backoff, and how many of the sessions come from a build that records retries at all |
+| `main_calls` | the main loop's model calls one at a time: seconds each kept you waiting, seconds lost to retries, and — by prompt size, by what reset the prompt, and by how long ago the call before ended and started — calls, prompt and cached tokens, cache hits, and the wait of a hit and of a miss |
+| `retries` | backoff retries of model calls by status, by kind of call and by model, the seconds of backoff, and how many of the sessions come from a build that records retries at all |
 | `tools` | responses with calls, responses with several calls (and, by kind, their calls and the seconds they took one after another and would have taken at once), calls and elapsed / run seconds per built-in tool, calls to unknown names, MCP calls / servers / tools / elapsed / run seconds |
 | `shell` | shell calls per lane (read / write / operator / unconfined / unrecorded / other — `unrecorded` is a call that named no lane), timeouts |
 | `approvals` | auto-approve decisions by tier, approval-prompt decisions by source, seconds spent waiting for your answer at the prompt, hook denials |
@@ -134,12 +134,12 @@ counts with almost no time; only a response whose results are missing
 up to fewer than `multi_call_responses`.
 
 `main_calls` looks at where the model's time and the prompt tokens went. A
-call's wait runs from the record that ended the work before it — the message
-it answers, a compaction, or another model call — to the call's own usage
-record, so it is the model's time, with any retry inside it. A call is a
-*hit* when at least half of its prompt was served from the provider's cache.
-The same calls are sorted three ways, and every row is printed even when
-empty:
+call starts at the record that ended the work before it — the message it
+answers, a compaction, a round-limit decision, or another model call — and
+ends at its own usage record, so its wait is the model's time, with any
+retry inside it. A call is a *hit* when at least half of its prompt was
+served from the provider's cache. The same calls are sorted several ways,
+and every row is printed even when empty:
 
 - `by_prompt_size` — every call, by the size of its prompt
   (`under_100k` … `600k_and_over`).
@@ -147,19 +147,36 @@ empty:
   a miss is expected: the session's first (`session_start`), the first after
   a `compaction`, a `resume` or a `clear`, and the first after the tool list
   or the system prompt changed (`tools_or_prompt_changed`).
-- `by_gap` — all the other calls, by the seconds since the main call before
-  them ended (`under_30s` … `900s_and_over`). Here the prompt repeats what
-  that call sent, so a miss means the cache had let go of it. The gap holds
-  the call itself, so a call slow enough is in a late row by its own doing.
+- `by_idle` and `by_prefix_age` — all the other calls, which repeat what the
+  main call before them sent, by how long ago that was when they started
+  (`under_30s` … `900s_and_over`). `by_idle` counts from the end of the call
+  before: the time between the two calls (tools, approvals, you).
+  `by_prefix_age` counts from its start: the same plus how long that call
+  took. Neither includes the call's own length, so a slow call does not move
+  itself down the table.
+
+These tables show how hits and misses fall; they do not say why. The
+providers do not document how long a cached prompt is kept, and a miss in a
+late row and a miss in an early one are both just misses. Three things the
+transcripts cannot show limit them further: some changes to the tool list
+leave no record (lagent's `mcp_load`, a tool gem-agent stops advertising),
+so their calls sit in the time tables as plain misses; gem-agent writes its
+reload records whether or not anything changed; and lagent writes a cached
+count of 0 both when nothing was cached and when the server reported no
+count, so a lagent "miss" may be a call whose cache use is unknown.
 
 `retry_sec_total` is the part of `wait_sec_total` spent before the attempt
 that answered began — the refused attempts and the backoff after each.
 
 `retries` can only count what the runtime wrote. gem-agent records a retry
 from v0.102.0; lagent does not. `sessions_recording` says how many of the
-counted sessions could hold a retry record, so a count of zero beside
-`sessions_recording: 0` means "not recorded", not "none". The error text of
-a retry is never printed — only its status (`429`, `503`, …).
+counted sessions could hold a retry record (started or resumed by such a
+build), so a zero in `retries.count`, `main_calls.calls_with_retry` or
+`main_calls.retry_sec_total` beside `sessions_recording: 0` means "not
+recorded", not "none". A call that gave up after its last attempt is in
+`retries` and in nothing under `main_calls`: the runtimes write no usage
+record for it. Only a retry's HTTP status, the kind of call and the model
+are read; nothing else of the record is printed.
 
 The table and `--json` are drawn from the same data; the table is the JSON
 laid out as indented lines.

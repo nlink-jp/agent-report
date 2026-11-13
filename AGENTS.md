@@ -26,6 +26,7 @@ cmd/root.go                   flags, default transcript locations, wiring
 internal/transcript/          JSONL reading (read only; no line limit)
 internal/aggregate/report.go  the report's shape — field order is print order
 internal/aggregate/aggregate.go  counting; the closed sets live here
+internal/aggregate/maincalls.go  main_calls and retries, with their buckets
 internal/render/              JSON, and the table drawn by walking that JSON
 docs/{en,ja}/    RFP
 scripts/         codesign / notarize / brew — vendored byte-identical
@@ -99,20 +100,35 @@ does, and gem-usage-lens is its other consumer.
   `ask_user` (it waits on the operator). MCP tools, `web_fetch` and
   `web_search` are Mutating in the runtimes (egress) and get their own kind.
   When a runtime adds a built-in, decide its kind from that flag.
-- **Main calls** (`main_calls`, `internal/aggregate/maincalls.go`): a call's
-  wait starts at the last `message`, `compaction` or non-main `usage`
-  record and ends at its own `usage` record — both runtimes write the usage
-  record just before the assistant message. Records that can land while a
-  call is in flight (`notice`, `mode_change`, `model_retry`) do not move the
-  start. A hit is half the prompt cached or more. `track` runs for every
-  record, counted or not, so a call just inside the period is still compared
-  with the one before it. The bucket lists are fixed and every row is
-  printed; adding or renaming a bucket changes what two reports can compare.
+- **Main calls** (`main_calls`, `internal/aggregate/maincalls.go`): a call
+  starts at the last `message`, `compaction`, `round_intervention` or
+  non-main `usage` record and ends at its own `usage` record — both runtimes
+  write the usage record just before the assistant message, and
+  `round_intervention` after the operator answered the round-limit dialog.
+  Records that can land while a call is in flight (`notice`, `mode_change`,
+  `model_retry`) do not move the start. A hit is half the prompt cached or
+  more. `track` runs for every record, counted or not, so a call just inside
+  the period is still compared with the one before it. `by_idle` and
+  `by_prefix_age` are measured to the call's *start*: a table measured to
+  its end sorted a slow call by its own length and was withdrawn before
+  release. The bucket lists are fixed and every row is printed; adding or
+  renaming a bucket changes what two reports can compare.
+- **Resets** (`after_reset`): `mcp_advertise` is written only when a tool is
+  newly advertised; `mcp_reload` and `skills_reload` on every reload,
+  changed or not; `added_directories` counts only with `granted` (the same
+  record is written at start). No record exists for lagent's `mcp_load` or
+  for a tool gem-agent stops advertising — those calls sit in the time
+  tables as plain misses (README says so).
 - **Retries**: gem-agent writes `model_retry` from v0.102.0 (its ADR-0116)
-  — `retryEra`; lagent writes none. Only `cause` (a closed set) and `model`
-  (through `modelRe`) are read out; the record's `error` is free text and
-  must stay unread. A retry is charged to a main call only when it names
-  that call's model and came after the last record that ended other work.
+  — `retryEra`; lagent writes none. A session can hold one if its header,
+  a `resumed` record's version, or a retry record itself says so. Only
+  `cause` and `source` (closed sets) and `model` (through `modelRe`) are
+  read out; any other field stays unread. A retry is charged to a main call
+  only when its `source` is `main` and no start-mover came between — the
+  model name cannot tell calls apart when no slot is set.
+- **lagent's cached count** is 0 both for "nothing cached" and for "the
+  server reported none" (lagent internal/llm); `not_recorded.cache_misses`
+  says it, and hit/miss on lagent is read with that in mind.
 - **The period**: records before `--since` are still walked, uncounted, so a
   call before the cutoff pairs with its result after it. Report times are UTC.
 - **Records written before gem-agent ADR-0057** carry no `source`; they are

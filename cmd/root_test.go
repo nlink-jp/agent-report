@@ -97,7 +97,11 @@ func TestParseSince(t *testing.T) {
 }
 
 // marker is planted in every free-text field a transcript has. It must
-// never reach the output, in either format.
+// never reach the output, in either format. One kind of string does
+// reach it by design — a version, a model id or a server name that has
+// exactly that shape (AGENTS.md, "Closed sets, not redaction") — so the
+// marker is planted in those fields in a form the patterns reject: a
+// resource path, an address.
 const marker = "ZQXSECRET"
 
 // plantTranscripts writes a gem-agent transcript under a fake home whose
@@ -128,7 +132,7 @@ func plantTranscripts(t *testing.T) string {
 		// A model id is shown as written when it has a model id's shape (the
 		// accepted residue, AGENTS.md); these two do not.
 		`{"ts":"2026-10-29T10:00:10Z","kind":"usage","data":{"source":"` + marker + `","model":"projects/` + marker + `/locations/global/endpoints/9","prompt":10}}`,
-		`{"ts":"2026-10-29T10:00:10.5Z","kind":"model_retry","data":{"model":"` + marker + `@example.com","attempt":2,"max":5,"cause":"` + marker + `","error":"` + marker + ` quota for project ` + marker + `","delay_ms":500}}`,
+		`{"ts":"2026-10-29T10:00:10.5Z","kind":"model_retry","data":{"model":"` + marker + `@example.com","source":"` + marker + `","attempt":2,"max":5,"cause":"` + marker + `","status":"` + marker + `","error":"` + marker + ` quota for project ` + marker + `","delay_ms":500}}`,
 		`{"ts":"2026-10-29T10:00:11Z","kind":"` + marker + `","data":{"x":"` + marker + `"}}`,
 		marker + ` not json`,
 	}

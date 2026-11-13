@@ -88,22 +88,28 @@ type TokenBucket struct {
 
 // MainCalls takes the main loop's model calls one at a time: how long each
 // kept the operator waiting and how much of what it sent was served from
-// the provider's cache. A call's wait runs from the record that ended the
-// work before it — the message it answers, a compaction, or another model
-// call's usage record — to its own usage record, so it is the model's
-// time and holds any retry inside it. RetrySecTotal is the part of
-// WaitSecTotal spent before the attempt that answered began: the refused
-// attempts and the backoff after each, read from the runtime's retry
-// records (see Retries for which sessions have them).
+// the provider's cache. A call starts at the record that ended the work
+// before it — the message it answers, a compaction, a round-limit
+// decision, or another model call's usage record — and ends at its own
+// usage record, so its wait is the model's time and holds any retry
+// inside it. RetrySecTotal is the part of WaitSecTotal spent before the
+// attempt that answered began: the refused attempts and the backoff
+// after each, read from the runtime's retry records. Where no session
+// could record a retry (see Retries) its zero, and CallsWithRetry's, mean
+// "not recorded".
 //
-// The three tables sort the same calls three ways. A call is a hit when
-// at least half of its prompt was cached. ByPromptSize takes every call.
-// AfterReset takes the calls whose prompt could not have been sent
-// before — the session's first, the first after a compaction, a resume
-// or a clear, and the first after the tool declarations or the system
-// prompt changed — where a miss is expected. ByGap takes all the others,
-// by the seconds since the main call before them ended: there the prompt
-// repeats what that call sent, so a miss is the cache having let go.
+// The tables sort the same calls. A call is a hit when at least half of
+// its prompt was cached. ByPromptSize takes every call. AfterReset takes
+// the calls whose prompt could not have been sent before — the session's
+// first, the first after a compaction, a resume or a clear, and the
+// first after the tool declarations or the system prompt changed — where
+// a miss is expected. The other calls repeat what the main call before
+// them sent, and are sorted twice by how long ago that was when they
+// started: ByIdle from the end of that call (the time between the two —
+// tools, approvals, the operator), ByPrefixAge from its start (the same
+// plus that call's own length). Neither includes the call's own length,
+// so a slow call does not move itself down its table. A call whose
+// predecessor's start is not known is in ByIdle only.
 type MainCalls struct {
 	Calls          int        `json:"calls"`
 	WaitSec        Dist       `json:"wait_sec"`
@@ -112,7 +118,8 @@ type MainCalls struct {
 	RetrySecTotal  float64    `json:"retry_sec_total"`
 	ByPromptSize   []CallCell `json:"by_prompt_size"`
 	AfterReset     []CallCell `json:"after_reset"`
-	ByGap          []CallCell `json:"by_gap"`
+	ByIdle         []CallCell `json:"by_idle"`
+	ByPrefixAge    []CallCell `json:"by_prefix_age"`
 }
 
 // CallCell is one row of a MainCalls table. Bucket is one of a fixed
@@ -129,16 +136,20 @@ type CallCell struct {
 	WaitSecMiss Dist   `json:"wait_sec_miss"`
 }
 
-// Retries counts the backoff retries of model calls, whichever model was
-// asked. Only a runtime build that writes a retry record can show any:
-// SessionsRecording is how many of the counted sessions came from such a
-// build, and a zero Count beside a zero SessionsRecording means "not
-// recorded", not "none". BackoffSecTotal adds up the waits between
-// attempts; it leaves out the time the refused attempts themselves took.
+// Retries counts the backoff retries of model calls, whichever call made
+// them. Only a runtime build that writes a retry record can show any:
+// SessionsRecording is how many of the counted sessions were started or
+// resumed by such a build, and a zero Count beside a zero
+// SessionsRecording means "not recorded", not "none". BackoffSecTotal
+// adds up the waits between attempts; it leaves out the time the refused
+// attempts themselves took. A call that gave up after its last attempt
+// leaves its retries here and nothing in MainCalls, because the runtimes
+// write no usage record for it.
 type Retries struct {
 	SessionsRecording int            `json:"sessions_recording"`
 	Count             int            `json:"count"`
 	ByCause           map[string]int `json:"by_cause"`
+	BySource          map[string]int `json:"by_source"`
 	ByModel           map[string]int `json:"by_model"`
 	BackoffSecTotal   float64        `json:"backoff_sec_total"`
 }

@@ -11,17 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `main_calls`: the main loop's model calls taken one at a time — the
   seconds each kept the operator waiting, the seconds lost to retries, and
-  three tables of calls, prompt and cached tokens, cache hits and waits: by
-  prompt size, after whatever reset the prompt (session start, compaction,
-  resume, clear, a change of tools or system prompt), and by the gap since
-  the call before. It reads records the runtimes have always written, so it
-  works on transcripts that already exist.
+  tables of calls, prompt and cached tokens, cache hits and waits: by prompt
+  size, after whatever reset the prompt (session start, compaction, resume,
+  clear, a change of tools or system prompt), and by how long ago the call
+  before ended (`by_idle`) and started (`by_prefix_age`). It reads records
+  the runtimes have always written, so it works on transcripts that already
+  exist.
 - `tokens_by_model`: calls and tokens per model, beside the existing
   per-source `tokens`.
-- `retries`: backoff retries of model calls by cause and by model, with the
-  seconds of backoff. gem-agent records a retry from v0.102.0 and lagent does
-  not; `sessions_recording` says how many sessions could hold one, and
-  `not_recorded` says the rest.
+- `retries`: backoff retries of model calls by status, by kind of call and by
+  model, with the seconds of backoff. gem-agent records a retry from v0.102.0
+  and lagent does not; `sessions_recording` says how many sessions could hold
+  one, and `not_recorded` says the rest.
+- `not_recorded` for lagent now says that a cached count of 0 may mean the
+  server reported none.
 
 ## [0.2.0] - 2026-11-03
 
