@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `make package` runs `make vuln` (`govulncheck ./...`) first and stops on a
+  finding, so a release cannot be built past one. The target existed; nothing
+  ran it on the way to a release.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added

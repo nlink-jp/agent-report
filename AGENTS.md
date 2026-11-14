@@ -13,7 +13,7 @@ emits no free text from the transcripts.
 make build    # → dist/agent-report (signed when a Developer ID cert is present)
 make test     # or: go test ./...
 make vet
-make vuln     # govulncheck
+make vuln     # govulncheck; `make package` runs it first and stops on a finding
 make package  # darwin-arm64 zip + notarization (release only)
 make verify-release
 ```

@@ -34,7 +34,7 @@ build-all:
 
 ## package: archive as <name>-v<version>-darwin-arm64.zip (canonical binary +
 ## README + LICENSE inside) and notarize it.
-package: build-all
+package: vuln build-all
 	@cd $(DIST_DIR) && stage=_pkg; rm -rf $$stage; mkdir -p $$stage; \
 		cp "$(BINARY)-darwin-arm64" "$$stage/$(BINARY)"; \
 		cp ../README.md ../LICENSE $$stage/; \
@@ -78,7 +78,10 @@ test:
 vet:
 	go vet ./...
 
-## vuln: known vulnerabilities in the standard library this toolchain builds with
+## vuln: known vulnerabilities in the modules and the standard library this
+## build uses (govulncheck). `package` depends on it, so a release cannot be
+## built past a finding. It needs the network, and its database changes under
+## an unchanged tree: a finding can appear without a commit.
 vuln:
 	govulncheck ./...
 
